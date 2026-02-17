@@ -33,9 +33,8 @@ To run the TFMethyl clock, place a beta matrix file (named "beta_test_matrix.csv
 `Analysis.Rmd` is dependent on bunch of input data structures mounted at `./Data/` directory, and installed CRAN/Bioconductor packages. Before running the script, do as follows:
 
 ```bash
-mkdir -p Data
-cd Data/
-wget link
+wget https://zenodo.org/records/18672348/files/data.gz
+tar -xzvf data.gz
 ```
 Then first run `./helper_scripts/packages_check.R`, finally followed by the `Analysis.Rmd` in a R enviornment. 
 
