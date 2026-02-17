@@ -1,0 +1,29 @@
+# TFMethyl Clock
+
+**Author:** Tushar Patel (Tushar.Patel@leibniz-fli.de; tusharpatel51099@gmail.com)  
+**Date:** 29-01-2026  
+
+## Description
+TFMethyl is a DNA methylation–based age prediction model.  
+Input DNA methylation beta values (CpGs × samples) are:
+
+1. Subset to the CpGs used during model training (Illumina 450K array)
+2. Reordered to match the trained CpG set
+3. Aggregated into predefined CpG clusters using the median
+4. Transposed to sample-wise format and passed to the trained model
+
+The model predicts **log-transformed age**, which is then back-transformed to
+chronological age (years).
+
+## Input
+- DNA methylation beta values  
+- Matrix or data.frame with **CpGs as rows and samples as columns**
+- CpG IDs must match Illumina 450K annotation
+
+## Required
+- R version 4.4.0 (or above); data.table 1.17.6; glmnet 4.1-9
+
+## Usage
+In R:
+```r
+source("TFMethyl.R")

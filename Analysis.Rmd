@@ -1,0 +1,2612 @@
+---
+title: "Enhancing the performance and interpretability of epigenetic clocks"
+author: "Tushar patel (tushar.patel@leibniz-fli.de; tusharpatel51099@gmail.com)"
+date: "2026-02-11"
+---
+
+```{r setup, include=FALSE}
+
+library(readr)
+library(dplyr)
+library(data.table)
+library(parallel)
+library(caret)
+library(glmnet)
+library(paletteer)
+library(stringr)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(GenomicRanges)
+library(rtracklayer)
+library(IlluminaHumanMethylationEPICv2anno.20a1.hg38)
+library(TxDb.Hsapiens.UCSC.hg38.knownGene) 
+library(ComplexHeatmap)
+library(tidyr)
+library(ggbreak)
+library(ggplot2)
+library(ggridges)
+library(tibble)
+library(ggpubr)
+library(circlize)            
+library(ggrepel)
+library(DESeq2)
+library(gridExtra)
+library(RMariaDB)
+library(GenomicFeatures)
+library(patchwork)
+library(biomaRt)
+library(ggrastr)
+library(Cairo)
+library(methylCIPHER)
+library(UpSetR)
+library(ChAMP)
+library(parallel)
+library(GO.db)
+library(matrixStats)
+library(ggsci)
+library(fmsb)
+library(GEOquery)
+library(purrr)  
+library(reticulate)
+library(colorRamp2)
+library(scales)
+library(igraph)
+library(ggraph)
+library(tidygraph)
+library(ggbeeswarm)
+library(Biostrings)
+library(ggseqlogo)
+library(tools)
+library(DunedinPACE)
+
+```
+
+## Creating TF-class and non TF-class CpGs annotation; and TF(s) at CpG location annotation
+
+- TF-class = regulatory_cpgs.rds
+- non TF-class = non_regulatory_cpgs.rds
+
+```{r CpG annotations}
+
+# Load CpG location data from EPIC annotation
+data("Locations", package = "IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+cpg_location <- as.data.frame(Locations)
+
+# Create Start and End positions for CpGs
+cpg_location <- cpg_location %>%
+  mutate(Start = pos - 1, End = pos + 1, Name = sub("_.*$", "", rownames(cpg_location)))
+
+# Load TFBS sites
+tfbs_sites <- fread("./Data/merged_intersection.bed")
+
+# Create and sort GRanges object for CpGs
+epic_gr <- GRanges(
+  seqnames = cpg_location$chr,
+  ranges = IRanges(start = cpg_location$Start, end = cpg_location$End),
+  Name = cpg_location$Name)
+epic_gr <- sort(epic_gr)  
+
+# Create GRanges object for TFBS sites
+reg_gr <- GRanges(
+  seqnames = tfbs_sites$V1,
+  ranges = IRanges(start = tfbs_sites$V2, end = tfbs_sites$V3))
+
+### Identify overlaps
+overlaps <- findOverlaps(epic_gr, reg_gr, ignore.strand = TRUE)
+
+# Extract overlapping CpGs
+overlapping_epic_gr <- epic_gr[queryHits(overlaps)]
+
+# Convert to data frame and remove duplicates
+overlapping_epic_gr_df <- as.data.frame(overlapping_epic_gr) %>% distinct()
+
+# Identify regulatory and non-regulatory CpGs
+regulatory_cpgs <- overlapping_epic_gr_df$Name
+non_regulatory_cpgs <- setdiff(unique(cpg_location$Name), regulatory_cpgs)
+
+# Save results
+saveRDS(regulatory_cpgs, "./Data/regulatory_cpgs.rds")
+head(regulatory_cpgs)
+
+saveRDS(non_regulatory_cpgs, "./Data/non_regulatory_cpgs.rds")
+head(non_regulatory_cpgs)
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+#Creating a TFBS and corresponding CpG site annotation
+
+# ### Load hg38 TFBS not merged annotation (from TFBS_annotation.sh)
+# tfbs_sites <- fread("./Data/sorted_intersection.bed")
+# 
+# # Create GRanges for TFBS sites
+# reg_gr <- GRanges(
+#   seqnames = tfbs_sites$V1,
+#   ranges = IRanges(start = tfbs_sites$V2, end = tfbs_sites$V3),
+#   TFs = tfbs_sites$V7) %>% unique()
+# 
+# ### Find overlaps with strand ignored
+# overlaps <- findOverlaps(epic_gr, reg_gr, ignore.strand = TRUE)
+# 
+# # Merge metadata for overlapping regions
+# merged_metadata <- pintersect(epic_gr[queryHits(overlaps)], reg_gr[subjectHits(overlaps)])
+# mcols(merged_metadata) <- cbind(mcols(epic_gr[queryHits(overlaps)]), mcols(reg_gr[subjectHits(overlaps)]))
+# merged_metadata <- unique(merged_metadata)
+# 
+# # Convert to data frame and save
+# merged_metadata_df <- as.data.frame(merged_metadata)
+# write.table(merged_metadata_df, 
+#             file = "./Data/CpGs_to_TFBS.bed", 
+#             sep = "\t", quote = FALSE, row.names = FALSE, col.names = FALSE)
+
+#-----------------------------------------------------------------------------------
+
+```
+
+## Calculate age correlations for all CpGs measured in all samples
+
+The methylation data set used (beta_matrix.csv) is borrowed as a curated set from: doi:10.1016/j.crmeth.2023.100567
+
+The validation samples removed (Validation_samples.rds) belongs to GSE84727. 
+
+```{r CpG age correlations}
+
+# Read the beta matrix from CSV
+beta_mat <- fread("./Data/beta_matrix.csv")
+
+# Load validation samples
+validation_samples <- readRDS("./Data/Validation_samples.rds")
+
+# Remove all validation samples (to avoid data-leakage)
+beta_mat_train <- beta_mat[!SampleID %in% validation_samples, ]
+
+# Split into train and test sets
+# Remove all test samples (also to avoid data-leakage)
+set.seed(50)
+test_indices <- as.numeric(createDataPartition(beta_mat_train$age, p = 0.3, list = FALSE))
+train_data <- beta_mat_train[-test_indices, ]
+
+# get the age vector for training samples
+train_data_age <- as.numeric(train_data$age)
+
+# Transpose data
+process_data <- function(df) {
+  df <- as.data.frame(t(df))
+  colnames(df) <- df[1, ]
+  df <- df[-1, ]
+  df <- df %>% mutate_if(is.character, as.numeric)
+  return(df)}
+train_data <- process_data(train_data)
+
+# Compute spearman correlation
+correlation <- apply(as.matrix(train_data), 1, function(row) {
+  if (length(unique(na.omit(row))) > 1) {
+    cor(as.numeric(row), train_data_age, method = "spearman", use = "complete.obs")
+  } else {
+    NA
+  }
+})
+
+# saving age correlations for all CpGs
+to_save <- data.frame(CpG = rownames(train_data), Correlation = as.numeric(correlation))
+saveRDS(to_save, "./Data/corr.rds")
+head(to_save)
+
+```
+
+## Combining the age correlation and the TFBS annotation CpG filters together 
+
+- feature selection
+
+```{r feature selection filter}
+
+# Load CpG site annotations
+
+# the CpGs which are measured in all samples in the DNAm dataset (beta_matrix.csv)
+array_cpgs <- readRDS("./Data/array_cpgs.rds")
+# the CpGs which have TF binding as annotated before
+regulatory_cpgs <- readRDS("./Data/regulatory_cpgs.rds")
+# the CpGs which have more than 0.1 averaged standard deviations across samples of same age
+cpg_filter <- readRDS("./Data/CpGs_to_remove_for_high_sd.rds")
+
+# Identify CpG sites present in both the tested array dataset and regulatory annotation 
+cpgs_test_all <- intersect(array_cpgs, regulatory_cpgs)
+
+# Remove CpG sites that have high standard deviation (likely effect of noise)
+cpgs_test_all <- setdiff(cpgs_test_all, cpg_filter)
+
+# Load the correlation data and convert it into a data frame
+corr <- as.data.frame(readRDS("./Data/corr.rds"))
+
+# Convert all columns except the first one (CpG identifier) to numeric values
+corr[-1] <- lapply(corr[-1], as.numeric)
+
+# Set CpG identifiers as row names and remove the original column
+rownames(corr) <- corr$CpG
+corr$CpG <- NULL
+
+# Select CpG sites that are both in the filtered dataset and in the correlation data
+to_select <- intersect(cpgs_test_all, rownames(corr))
+corr <- corr[to_select, , drop = FALSE]
+
+# Sort correlation values in ascending order
+corr <- corr[order(corr$Correlation), , drop = FALSE]
+
+# Filter correlations that are either above 0.5 or below -0.5
+corr_filtered <- corr %>% filter(if_any(everything(), ~ . > 0.5 | . < -0.5))
+
+# Extract the CpG site names that meet the correlation threshold
+top_cpgs <- rownames(corr_filtered)
+
+# Save the list of top correlated CpG sites to a file
+saveRDS(top_cpgs, "./Data/top_corr_tfbs_cpgs.rds")
+
+```
+
+## Systematic assessment of epigenetic clocks for regulatory potential and age prediction performance - Figure 1A. 
+
+Get the CpGs from the clocks using library(methylCIPHER) and library(DunedinPACE)
+
+GP-clock CpGs (Gaussian_cpgs) are from the Table S3 supplementary section of paper: doi.org/10.1016/j.crmeth.2023.100567
+
+```{r Figure 1A, fig.width=10, fig.height=6}
+
+#loading the CpGs per clock
+Gaussian_cpgs <- read.csv("./Data/gaussian_CpGs.csv")$CpG[-72]
+Pheno_age_cpgs <- PhenoAge_CpGs$CpG
+Hannum_age_cpgs <- Hannum_CpGs$Marker
+hor1_age_cpgs <- Horvath1_CpGs$CpGmarker
+hor2_age_cpgs <- Horvath2_CpGs$ID
+EpiToc2_cpgs <- rownames(EpiToc2_CpGs)
+GrimAge2_cpgs <- GrimAge2_CpGs$CpG
+DunedinPACE_cpgs <- DunedinPACE::getRequiredProbes()$DunedinPACE
+
+# Get the CpGs with and without TFBS
+regulatory_cpgs <- unique(readRDS("./Data/regulatory_cpgs.rds"))
+non_regulatory_cpgs <- unique(readRDS("./Data/non_regulatory_cpgs.rds"))
+bg_tfbs <- c(regulatory_cpgs, non_regulatory_cpgs)
+
+# Finding the cpgs in each model with TFBS
+Gaussian_cpgs_tfbs <- intersect(regulatory_cpgs, Gaussian_cpgs)
+Pheno_age_cpgs_tfbs <- intersect(regulatory_cpgs, Pheno_age_cpgs)
+Hannum_age_cpgs_tfbs <- intersect(regulatory_cpgs, Hannum_age_cpgs)
+hor1_age_cpgs_tfbs <- intersect(regulatory_cpgs, hor1_age_cpgs)
+hor2_age_cpgs_tfbs <- intersect(regulatory_cpgs, hor2_age_cpgs)
+EpiToc2_cpgs_tfbs <- intersect(regulatory_cpgs, EpiToc2_cpgs)
+GrimAge2_cpgs_tfbs <- intersect(regulatory_cpgs, GrimAge2_cpgs)
+DunedinPACE_cpgs_tfbs <- intersect(regulatory_cpgs, DunedinPACE_cpgs)
+
+# getting cpgs with an age correlation of more than 0.5
+corr <- as.data.frame(readRDS("./Data/corr.rds"))
+corr[-1] <- lapply(corr[-1], as.numeric)
+rownames(corr) <- corr$CpG
+corr$CpG <- NULL
+correlations <- rownames(as.data.frame(corr[corr$Correlation > 0.5 | corr$Correlation < -0.5, , drop = FALSE]))
+bg_corr <- rownames(corr)
+
+# Finding the cpgs in each model with correlation of more than 0.5
+Gaussian_cpgs_tfbs_age <- intersect(Gaussian_cpgs_tfbs, correlations)
+Pheno_age_cpgs_tfbs_age <- intersect(Pheno_age_cpgs_tfbs, correlations)
+Hannum_age_cpgs_tfbs_age <- intersect(Hannum_age_cpgs_tfbs, correlations)
+hor1_age_cpgs_tfbs_age <- intersect(hor1_age_cpgs_tfbs, correlations)
+hor2_age_cpgs_tfbs_age <- intersect(hor2_age_cpgs_tfbs, correlations)
+EpiToc2_cpgs_tfbs_age <- intersect(EpiToc2_cpgs_tfbs, correlations)
+GrimAge2_cpgs_tfbs_age <- intersect(GrimAge2_cpgs_tfbs, correlations)
+DunedinPACE_cpgs_tfbs_age <- intersect(DunedinPACE_cpgs_tfbs, correlations)
+
+# Finding percentage of cpgs in clocks which have TFBS and strong age correlations
+Gaussian_cpgs_sig <- length(Gaussian_cpgs_tfbs_age) / length(intersect(intersect(Gaussian_cpgs, bg_tfbs), bg_corr)) * 100
+Pheno_age_cpgs_sig <- length(Pheno_age_cpgs_tfbs_age) / length(intersect(intersect(Pheno_age_cpgs, bg_tfbs), bg_corr)) * 100
+Hannum_age_cpgs_sig <- length(Hannum_age_cpgs_tfbs_age) / length(intersect(intersect(Hannum_age_cpgs, bg_tfbs), bg_corr)) * 100
+hor1_age_cpgs_sig <- length(hor1_age_cpgs_tfbs_age) / length(intersect(intersect(hor1_age_cpgs, bg_tfbs), bg_corr)) * 100
+hor2_age_cpgs_sig <- length(hor2_age_cpgs_tfbs_age) / length(intersect(intersect(hor2_age_cpgs, bg_tfbs), bg_corr)) * 100
+EpiToc2_cpgs_sig <- length(EpiToc2_cpgs_tfbs_age) / length(intersect(intersect(EpiToc2_cpgs, bg_tfbs), bg_corr)) * 100
+GrimAge2_cpgs_sig <- length(GrimAge2_cpgs_tfbs_age) / length(intersect(intersect(GrimAge2_cpgs, bg_tfbs), bg_corr)) * 100
+DunedinPACE_cpgs_sig <- length(DunedinPACE_cpgs_tfbs_age) / length(intersect(intersect(DunedinPACE_cpgs, bg_tfbs), bg_corr)) * 100
+
+# preparing dataframe for plots
+category = c("DunedinPACE", "PhenoAge", "GrimAge2", "Horvath1", "EpiToc2", "Horvath2", "Hannum", "GP-clock")
+percent = c(DunedinPACE_cpgs_sig, Pheno_age_cpgs_sig, GrimAge2_cpgs_sig, hor1_age_cpgs_sig, EpiToc2_cpgs_sig, hor2_age_cpgs_sig, Hannum_age_cpgs_sig, Gaussian_cpgs_sig)
+color <- c("#DCDCDC", "#D3D3D3", "#C0C0C0", "#A9A9A9", "#808080", "#696969", "#708090", "#36454F")
+
+# plotting
+circos.par("start.degree" = 90, cell.padding = c(0, 0, 0, 0))
+circos.initialize("a", xlim = c(0, 100)) # 'a` just means there is one sector
+circos.track(ylim = c(0.5, length(percent) + 0.5), track.height = 0.8, 
+             bg.border = NA, panel.fun = function(x, y) {
+               xlim = CELL_META$xlim
+               circos.segments(rep(xlim[1], 8), 1:8,
+                               rep(xlim[2], 8), 1:8,
+                               col = "#CCCCCC")
+               circos.rect(rep(0, 8), 1:8 - 0.45, percent, 1:8 + 0.45,
+                           col = color, border = "white")
+               circos.text(rep(xlim[1], 8), 1:8, 
+                           paste(category),  # Rounded values
+                           facing = "downward", adj = c(1.05, 0.5), cex = 1.2)  # Increased text size
+               breaks = seq(0, 85, by = 5)
+               circos.axis(h = "top", major.at = breaks, labels = paste0(breaks, "%"), 
+                           labels.cex = 1.4)})
+
+```
+
+## Systematic assessment of epigenetic clocks for regulatory potential and age prediction performance - Figure 1B.
+
+Repeatedly sampling CpGs (with age |⍴| < 0.3 & non-overlapping TFBS) to train elastic net models predicting age from DNA methylation data.
+
+```{r Figure 1B, fig.width=16, fig.height=9}
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+# # Read the beta matrix from CSV
+# beta_mat <- fread("./Data/beta_matrix.csv")
+# 
+# # Load CpG to TF mapping data
+# # Created from hg38 whole genome TFBS profiles. 
+# cpg_to_TF <- fread("./Data/CpGs_to_TFBS.bed") %>% as.data.frame()
+# 
+# # Load correlation data
+# corr <- readRDS("./Data/corr.rds") %>% as.data.frame()
+# corr[-1] <- lapply(corr[-1], as.numeric)
+# rownames(corr) <- corr$CpG
+# corr$CpG <- NULL
+# 
+# # Filter correlated CpGs
+# correlated_cpgs <- rownames(corr[corr$Correlation < 0.3 & corr$Correlation > -0.3, , drop = FALSE])
+# correlated_cpgs <- intersect(correlated_cpgs, colnames(beta_mat))
+# input_cpgs <- setdiff(correlated_cpgs, cpg_to_TF$V6)
+# 
+# # Select relevant columns
+# cols_to_keep <- c("SampleID", "age", input_cpgs)
+# beta_mat <- beta_mat[, ..cols_to_keep]
+# 
+# # Load validation sample IDs
+# validation_samples <- readRDS("./Data/Validation_samples.rds")
+# 
+# # Split into training and validation sets
+# beta_mat_validation <- beta_mat[beta_mat$SampleID %in% validation_samples, ]
+# beta_mat_train <- beta_mat[!beta_mat$SampleID %in% validation_samples, ]
+# 
+# # Separate age variable
+# train_data_age <- as.numeric(beta_mat_train$age)
+# beta_mat_train$age <- NULL
+# 
+# test_data_age <- as.numeric(beta_mat_validation$age)
+# beta_mat_validation$age <- NULL
+# 
+# # Initialize error tracking and CpG storage
+# errors_df <- data.frame(matrix(ncol = 0, nrow = nrow(beta_mat_validation)))
+# cpg_list <- list()
+# 
+# # Iterate through 100 runs while training models from 10k random cpgs and then test it over validation data predicting age
+# for (i in 1:100) {
+#   
+#   beta_train <- t(beta_mat_train) %>% as.data.frame()
+#   colnames(beta_train) <- beta_train[1, ]
+#   beta_train <- beta_train[-1, ] %>% mutate_if(is.character, as.numeric)
+#   
+#   if (nrow(beta_train) == 0) break
+#   
+#   set.seed(i)
+#   beta_train <- beta_train[sample(nrow(beta_train), size = min(10000, nrow(beta_train))), ]
+#   
+#   set.seed(123)
+#   model <- cv.glmnet(x = as.matrix(t(beta_train)), y = log(train_data_age + 1), nfolds = 30, alpha = 0.1, family = "gaussian")
+#   
+#   beta_test <- t(beta_mat_validation) %>% as.data.frame()
+#   colnames(beta_test) <- beta_test[1, ]
+#   beta_test <- beta_test[-1, ] %>% mutate_if(is.character, as.numeric)
+#   beta_test <- beta_test[rownames(beta_train), ]
+#   
+#   y_pred <- exp(as.numeric(predict(model, as.matrix(t(beta_test))))) - 1
+#   
+#   errors_df <- cbind(errors_df, y_pred)
+#   colnames(errors_df)[ncol(errors_df)] <- paste("Itr", i, sep = "_")
+#   
+#   coefficients <- coef(model, s = model$lambda.min)
+#   coefficients_df <- as.data.frame(as.matrix(coefficients)) %>% tibble::rownames_to_column(var = "variable") %>% filter(if_any(-variable, ~ . != 0))
+# 
+#   cpg_list[[i]] <- coefficients_df$variable
+#   
+# }
+# 
+# write.csv(errors_df, "./Data/errors_with_random_cpgs.csv", row.names = FALSE)
+# saveRDS(cpg_list, "./Data/errors_with_random_cpgs.rds")
+
+#-----------------------------------------------------------------------------------
+
+#load pre-computed data structures
+errors_df <- read.csv("./Data/errors_with_random_cpgs.csv")
+cpg_list <- readRDS("./Data/errors_with_random_cpgs.rds")
+
+# Get the actual age of validation samples
+age <- readRDS("./Data/Validation_samples_age.rds")
+
+# Compute mean absolute errors
+errors <- as.data.frame(sapply(errors_df, function(col) abs(col - age)))
+
+# Compute CpG correlation means
+corr <- readRDS("./Data/corr.rds") %>% as.data.frame()
+corr[-1] <- lapply(corr[-1], as.numeric)
+colnames(corr) <- c("group", "corr")
+process_nested_list <- function(entries, dataframe) mean(dataframe[dataframe$group %in% entries, "corr"])
+result <- sapply(cpg_list, process_nested_list, dataframe = corr)
+
+# Compute median error
+col_avg <- median(colMedians(as.matrix(errors)))
+
+# Generate plot
+layout(matrix(c(1, 2), nrow = 2, byrow = TRUE), heights = c(3, 1))
+par(mar = c(0, 5, 4, 2))
+boxplot(errors, main = "CpGs Age |⍴| < 0.3 & non-overlapping TFBS clock models on GSE84727", ylab = "Errors (years)", xaxt = "n", cex.lab = 1.6)
+abline(h = col_avg, col = "red", lty = 2)
+par(mar = c(5, 5, 1, 2))
+plot(result, xlab = "Iterations", ylab = "CpGs_corr.", ylim = c(0, 1), cex.lab = 1.6)
+
+```
+
+## Mine the CpGs while evaluating prediction performance - Figure Supp. 2
+
+```{r Figure Supp. 2, fig.width=10, fig.height=6}
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+# # Read the beta matrix from CSV
+# beta_mat <- fread("./Data/beta_matrix.csv")
+# 
+# # Load validation sample IDs from another dataset
+# validation_samples <- readRDS("./Data/Validation_samples.rds")
+# 
+# # Split the data into training and validation sets
+# beta_mat_validation <- beta_mat[beta_mat$SampleID %in% validation_samples, ]
+# beta_mat_train <- beta_mat[!beta_mat$SampleID %in% validation_samples, ]
+# 
+# # Separate target variable 'age' from the dataset
+# train_data_age <- as.numeric(beta_mat_train$age)
+# beta_mat_train$age <- NULL
+# beta_mat_train <- as.data.frame(beta_mat_train)
+# 
+# test_data_age <- as.numeric(beta_mat_validation$age)
+# beta_mat_validation$age <- NULL
+# beta_mat_validation <- as.data.frame(beta_mat_validation)
+# 
+# # Initialize error tracking variables
+# errors_all <- numeric()
+# number_of_selected_cpgs <- numeric()
+# 
+# print(ncol(beta_mat_train))
+# 
+# # Iterative model training and CpG site selection
+# for (i in 1:ncol(beta_mat_train)) {
+#   
+#   # Transpose training data and convert to numeric
+#   beta_train <- as.data.frame(t(beta_mat_train))
+#   colnames(beta_train) <- beta_train[1, ]
+#   beta_train <- beta_train[-1, ]
+#   beta_train <- beta_train %>% mutate_if(is.character, ~ as.numeric(.))
+#   
+#   # Check if beta_train is empty
+#   if (nrow(beta_train) == 0) {break}
+#   
+#   # Train Elastic Net model using cross-validation
+#   set.seed(123)
+#   model <- cv.glmnet(x = as.matrix(t(beta_train)), y = log(as.numeric(train_data_age) + 1), nfolds = 10, alpha = 0.5, family = "gaussian")
+#   
+#   # Transpose validation data and convert to numeric
+#   beta_test <- as.data.frame(t(beta_mat_validation))
+#   colnames(beta_test) <- beta_test[1, ]
+#   beta_test <- beta_test[-1, ]
+#   beta_test <- beta_test %>% mutate_if(is.character, ~ as.numeric(.))
+#   beta_test <- beta_test[rownames(beta_train), ]
+#   
+#   # Predict age using the trained model
+#   y_pred <- exp(as.numeric(predict(model, t(beta_test)))) - 1
+#   
+#   # Store errors and selected CpG sites
+#   error <- round(median(abs(y_pred - test_data_age)), digits = 2)
+#   errors_all <- c(errors_all, error)
+#   
+#   # Extract selected features (CpGs) from the model
+#   coefficients <- coef(model, s = model$lambda.min)
+#   coefficients <- as.data.frame(as.matrix(coefficients))
+#   coefficients <- coefficients[coefficients[, 1] != 0, , drop = FALSE]
+#   coefficients <- rownames(coefficients)[-1]
+#   number_of_selected_cpgs <- c(number_of_selected_cpgs, length(coefficients))
+#   
+#   # Update training data by removing selected CpG sites
+#   beta_mat_train <- beta_mat_train[, setdiff(names(beta_mat_train), coefficients)]
+# }
+# 
+
+#-----------------------------------------------------------------------------------
+
+# Load saved results for visualization
+errors_all <- readRDS("./Data/median_errors_with_cpg_mining.rds")
+number_of_selected_cpgs <- readRDS("./Data/number_of_selected_cpgs_mining.rds")
+
+# Calculate the cumulative sum for each iteration
+cumulative_sum <- cumsum(number_of_selected_cpgs)
+
+# Gradient color palette
+colors <- colorRampPalette(c("#1E8E99", "#993F00"))(length(errors_all))
+
+# Plot errors and selected CpGs
+par(mar = c(5, 5, 5, 6) + 0.1, cex.axis = 1.5, cex.lab = 1.8, cex.main = 2)
+plot(errors_all, type = "n", ylab = "Errors (MdAE)", xlab = "Iterations", ylim = range(errors_all))
+segments(seq_along(errors_all)[-length(errors_all)], errors_all[-length(errors_all)], seq_along(errors_all)[-1], errors_all[-1], col = colors, lwd = 4)
+#Median errors of prediction if all samples were predicted as mean of the training cohort
+abline(h = 19.45, col = "red", lty = 2, lwd = 2)
+# Overlay cumulative CpGs
+par(new = TRUE)
+plot(rev(cumulative_sum), type = "n", axes = FALSE, xlab = "", ylab = "")
+segments(seq_along(cumulative_sum)[-length(cumulative_sum)], rev(cumulative_sum)[-length(cumulative_sum)], seq_along(cumulative_sum)[-1], rev(cumulative_sum)[-1], col = colors, lwd = 4)
+axis(4, at = pretty(rev(cumulative_sum)), labels = pretty(cumulative_sum), cex.axis = 1.5)
+mtext("Remaining CpGs", side = 4, line = 3, las = 3, cex = 1.8)
+
+```
+
+## Effects of TF binding at the CpG loci and their target genes during aging - Figure 2A. 
+
+Finding the chromHMM annotations of the CpGs in two classes
+
+```{r Figure 2A, fig.width=7, fig.height=6}
+
+# Loading TFBS binding and non-binding CpG
+regulatory_cpgs <- readRDS("./Data/regulatory_cpgs.rds")
+non_regulatory_cpgs <- readRDS("./Data/non_regulatory_cpgs.rds")
+
+# Loading CpGs annotations
+array_cpgs <- readRDS("./Data/array_cpgs.rds")
+cpg_filter <- readRDS("./Data/CpGs_to_remove_for_high_sd.rds")
+
+# Intersecting with array present CpGs
+intersect_regulatory <- base::intersect(regulatory_cpgs, array_cpgs)
+intersect_regulatory <- base::setdiff(intersect_regulatory, cpg_filter)
+
+intersect_non_regulatory <- base::intersect(non_regulatory_cpgs, array_cpgs)
+intersect_non_regulatory <- base::setdiff(intersect_non_regulatory, cpg_filter)
+
+# Looking at more inside of CpGs in TFBS and non-TFBS
+cpg_location <- as.data.frame(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Locations)
+cpg_location$Start <- cpg_location$pos - 1
+cpg_location$End <- cpg_location$pos + 1
+cpg_location$Name <- sub("_.*$", "", rownames(cpg_location))
+
+# Creating GRanges for CpGs in regulatory and non-regulatory group
+reg_gr <- cpg_location[cpg_location$Name %in% intersect_regulatory, ]
+nonreg_gr <- cpg_location[cpg_location$Name %in% intersect_non_regulatory, ]
+
+reg_gr <- GRanges(seqnames = reg_gr$chr,
+  ranges = IRanges(start = reg_gr$Start, end = reg_gr$End))
+reg_gr <- unique(reg_gr)
+
+nonreg_gr <- GRanges(seqnames = nonreg_gr$chr,
+  ranges = IRanges(start = nonreg_gr$Start, end = nonreg_gr$End))
+nonreg_gr <- unique(nonreg_gr)
+
+# Loading chromHMM annotations
+chrom.hmm.gr <- readRDS("./Data/chrom.hmm.gr.rds")
+
+# intersecting with chromHMM annotations with CpGs in two class
+intersected_reg <- findOverlaps(reg_gr, chrom.hmm.gr)
+intersected_reg <- chrom.hmm.gr[subjectHits(intersected_reg)]
+intersected_reg <- as.data.frame(intersected_reg)
+
+intersected_nonreg <- findOverlaps(nonreg_gr, chrom.hmm.gr)
+intersected_nonreg <- chrom.hmm.gr[subjectHits(intersected_nonreg)]
+intersected_nonreg <- as.data.frame(intersected_nonreg)
+
+# finding frequency of CpGs into chromHMM categories, for the two CpG classes
+chrom.hmm.freq_reg <- intersected_reg %>% dplyr::group_by(state_type) %>% dplyr::summarise(freq = n())
+chrom.hmm.freq_reg$group <- "TF-class"
+chrom.hmm.freq_reg <- chrom.hmm.freq_reg[order(chrom.hmm.freq_reg$freq), ]
+
+chrom.hmm.freq_nonreg <- intersected_nonreg %>% dplyr::group_by(state_type) %>% dplyr::summarise(freq = n())
+chrom.hmm.freq_nonreg$group <- "non TF-class"
+chrom.hmm.freq_nonreg <- chrom.hmm.freq_nonreg[order(chrom.hmm.freq_nonreg$freq), ]
+
+combined_df <- bind_rows(chrom.hmm.freq_reg, chrom.hmm.freq_nonreg)
+
+custom_colors <- c(
+  "Acet"   = "#F0EEDC",  
+  "BivProm" = "#C3A9C8", 
+  "DNase"  = "#F5F5C0",  
+  "EnhA"   = "#D4A87A",  
+  "EnhWk"  = "#E0DA7B",  
+  "TxEnh"  = "#B8C76A",  
+  "HET"    = "#89AFC3", 
+  "Prom"   = "#D8623C", 
+  "TSS"    = "#C43C3C",  
+  "Tx"     = "#5A734F",  
+  "TxEx"   = "#93B15F",  
+  "TxWk"   = "#719A53",  
+  "Quies"  = "#D4D4D4", 
+  "GapArtf" = "#DDDDDD", 
+  "ReprPC" = "grey60",   
+  "znf"    = "#82B2A2")
+
+# preparing dataframe for plotting
+combined_df_prop <- combined_df %>%
+  group_by(group) %>%
+  mutate(prop = freq / sum(freq))
+
+combined_df_prop$state_type <- factor(
+  combined_df_prop$state_type,
+  levels = rev(c("Acet", "DNase", "BivProm", "Prom", "TSS", "Tx", "TxEx", "TxWk", "TxEnh", 
+                 "EnhA", "EnhWk", "HET", "znf", "ReprPC", "Quies", "GapArtf")))
+ 
+ggplot(combined_df_prop, aes(x = group, y = prop, fill = state_type)) +
+  geom_bar(stat = "identity", position = "fill", width = 0.7) +
+  labs(title = "Chromatin_state_CpGs", x = "Group", y = "Proportion") +
+  theme_minimal() +
+  scale_fill_manual(values = custom_colors) +
+  theme(axis.title = element_text(size = 16), 
+        axis.text = element_text(size = 14))
+
+```
+
+## Effects of TF binding at the CpG loci and their target genes during aging - Figure 2B
+
+Connecting gene-targets to CpGs following illumina annotations, and then looking at expression pattern of target genes with age for the two CpG classes. 
+
+```{r Figure 2B, fig.width=14, fig.height=6, warning=FALSE}
+
+# Defining colors for two classes
+custom_colors <- c("TF-class" = "#1E8E99", "non TF-class" = "#993F00") 
+
+# Loading TFBS binding and non-binding CpGs
+regulatory_cpgs <- readRDS("./Data/regulatory_cpgs.rds")
+non_regulatory_cpgs <- readRDS("./Data//non_regulatory_cpgs.rds")
+
+# CpGs annotations
+array_cpgs <- readRDS("./Data/array_cpgs.rds")
+cpg_filter <- readRDS("./Data/CpGs_to_remove_for_high_sd.rds")
+
+# Intersecting with array present CpGs
+intersect_regulatory <- base::intersect(regulatory_cpgs, array_cpgs)
+intersect_regulatory <- base::setdiff(intersect_regulatory, cpg_filter)
+
+intersect_non_regulatory <- base::intersect(non_regulatory_cpgs, array_cpgs)
+intersect_non_regulatory <- base::setdiff(intersect_non_regulatory, cpg_filter)
+
+#Intersecting TFBS and non-TFBS with illumina array
+epic_annotation <- as.data.frame(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Other)
+epic_regulatory <- epic_annotation %>% filter(Methyl450_Loci %in% intersect_regulatory)
+epic_non_regulatory <- epic_annotation %>% filter(Methyl450_Loci %in% intersect_non_regulatory)
+
+#getting gene targets of the both groups of CpGs, removing the repeated ones
+remove_repeated_entries <- function(x) {
+  unique_entries <- unique(unlist(strsplit(as.character(x), ";")))
+  paste(unique_entries, collapse = ";")}
+
+epic_regulatory <- epic_regulatory %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+epic_non_regulatory <- epic_non_regulatory %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+
+epic_regulatory_genes <- unique(unlist(strsplit(epic_regulatory$UCSC_RefGene_Name, ";"))) 
+epic_non_regulatory_genes <- unique(unlist(strsplit(epic_non_regulatory$UCSC_RefGene_Name, ";"))) 
+
+epic_regulatory_genes_f <- base::setdiff(epic_regulatory_genes, base::intersect(epic_regulatory_genes, epic_non_regulatory_genes))
+epic_non_regulatory_genes_f <- base::setdiff(epic_non_regulatory_genes, base::intersect(epic_regulatory_genes, epic_non_regulatory_genes))
+
+#gene expression analysis
+
+#loading gene expression data
+tpm_blood <- fread("./Data/gene_tpm_2022-06-06_v10_whole_blood.gct", skip = 2) 
+tpm_blood_metadata <- fread("./Data/GTEx_Analysis_v10_Annotations_SubjectPhenotypesDS.txt") 
+
+#filtering relevant genes, averaging the same names gene together 
+tpm_blood$Name <- NULL
+tpm_blood <- as.data.frame(tpm_blood)
+filtered_tpm_blood <- tpm_blood[tpm_blood$Description %in% c(epic_regulatory_genes_f, epic_non_regulatory_genes_f), ]
+filtered_tpm_blood <- filtered_tpm_blood %>% group_by(Description) %>%  summarise_all(mean, na.rm = TRUE)
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood)
+rownames(filtered_tpm_blood) <- filtered_tpm_blood$Description
+filtered_tpm_blood$Description <- NULL
+colnames(filtered_tpm_blood) <- substr(colnames(filtered_tpm_blood), 1, 10)
+filtered_tpm_blood <- as.data.frame(t(filtered_tpm_blood))
+
+#taking the middle value of age group in metadata
+tpm_blood_metadata$AGE <- as.numeric(substr(tpm_blood_metadata$AGE, 1, 2)) + 5
+tpm_blood_metadata <- tpm_blood_metadata %>% arrange(AGE)
+tpm_blood_metadata <- as.data.frame(tpm_blood_metadata %>% filter(SUBJID %in% rownames(filtered_tpm_blood)))
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood[tpm_blood_metadata$SUBJID, ])
+
+#filtering only the samples whose age is known, and then calculating median for age groups
+filtered_tpm_blood <- filtered_tpm_blood %>% rownames_to_column(var = "SUBJID")
+filtered_tpm_blood_combined <- tpm_blood_metadata %>% dplyr::select(SUBJID, AGE) %>% inner_join(filtered_tpm_blood, by = "SUBJID")
+filtered_tpm_blood_combined <- filtered_tpm_blood_combined %>%
+  dplyr::group_by(AGE) %>%
+  dplyr::summarise(across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+filtered_tpm_blood_combined <- filtered_tpm_blood_combined[, colSums(filtered_tpm_blood_combined != 0) > 0]
+
+#preparing matrix for correlation 
+common_columns <- intersect(epic_regulatory_genes_f, colnames(filtered_tpm_blood_combined))
+filtered_tpm_blood_regulatory <- filtered_tpm_blood_combined[, common_columns]
+common_columns <- intersect(epic_non_regulatory_genes_f, colnames(filtered_tpm_blood_combined))
+filtered_tpm_blood_non_regulatory <- filtered_tpm_blood_combined[, common_columns]
+
+#----------------------------------------------------------------------------
+
+#Looking at correlation with age 
+correlation_results_regulatory <- sapply(filtered_tpm_blood_regulatory, function(column) {
+  cor.test(column, filtered_tpm_blood_combined$AGE, method = "spearman")$estimate # Extract correlation coefficient
+})
+
+correlation_results_non_regulatory <- sapply(filtered_tpm_blood_non_regulatory, function(column) {
+  cor.test(column, filtered_tpm_blood_combined$AGE, method = "spearman")$estimate # Extract correlation coefficient
+})
+
+#down sampling to lowest number of cases
+set.seed(10)
+correlation_results_regulatory <- sample(correlation_results_regulatory, length(correlation_results_non_regulatory))
+
+# Combine the vectors into a dataframe
+data <- data.frame(value = c(correlation_results_regulatory, correlation_results_non_regulatory),
+  CpGs_TFBS = c(rep("TF-class", length(correlation_results_regulatory)), rep("non TF-class", length(correlation_results_non_regulatory))))
+
+p1 <- ggplot(data, aes(x = CpGs_TFBS, y = value, fill = CpGs_TFBS)) +
+  geom_boxplot(width = 0.3, color = "black", alpha = 0.3, outlier.color = "black") +
+  stat_compare_means(method = "wilcox.test", size = 5, label.y = 1.2, label.x = 1.3) +
+  theme(axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x  = element_text(size = 15),
+    axis.text.y  = element_text(size = 15),
+    panel.background = element_rect(fill = "white", color = NA), # white background
+    panel.grid.major = element_blank(),  # remove major grid lines
+    panel.grid.minor = element_blank(),  # remove minor grid lines
+    axis.ticks = element_line(color = "black"), # keep axis ticks
+    legend.position = "none") +
+  labs(title = "",
+    x = "Group",
+    y = "Correlation") +
+  scale_fill_manual(values = custom_colors)
+
+p2 <- ggplot(data, aes(x = value, fill = CpGs_TFBS, group = CpGs_TFBS)) +  
+  geom_histogram(alpha = 0.5, position = "identity", binwidth = 0.1) +  # Adjust bin width
+  labs(title = "CpG_target_genes_correlation_with_age",
+    x = "Correlation",
+    y = "Gene_count") +
+  theme(axis.title.x = element_text(size = 16),  
+    axis.title.y = element_text(size = 16),  
+    axis.text.x  = element_text(size = 15),   
+    axis.text.y  = element_text(size = 15),
+    panel.background = element_rect(fill = "white", color = NA),  # white background
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    axis.ticks = element_line(color = "black"), # keep tick marks
+    axis.line = element_line(color = "black"),  # add black axis lines
+    legend.position = "right") +
+  scale_fill_manual(values = custom_colors) +
+  xlim(-1, 1)
+
+p2 + p1 + plot_layout(ncol = 2, widths = c(2, 1))
+
+#-----------------------
+
+#Looking at standard deviations with age 
+sd_results_regulatory <- apply(filtered_tpm_blood_regulatory, 2, sd)
+sd_results_non_regulatory <- apply(filtered_tpm_blood_non_regulatory, 2, sd)
+
+set.seed(10)
+sd_results_regulatory <- sample(sd_results_regulatory, length(sd_results_non_regulatory))
+
+# Combine the vectors into a dataframe
+data <- data.frame(value = c(sd_results_regulatory, sd_results_non_regulatory),
+  CpGs_TFBS = c(rep("TF-class", length(sd_results_regulatory)), rep("non TF-class", length(sd_results_non_regulatory))))
+
+#remove outlier candidates above and below 75 and 25% CI
+remove_outliers <- function(data, column) {
+  Q1 <- quantile(data[[column]], 0.25) 
+  Q3 <- quantile(data[[column]], 0.75) 
+  IQR <- Q3 - Q1                      
+  lower_bound <- Q1 - 1.5 * IQR       
+  upper_bound <- Q3 + 1.5 * IQR       
+  data <- data[data[[column]] >= lower_bound & data[[column]] <= upper_bound, ]
+  return(data)}
+
+data <- remove_outliers(data, "value")
+
+# Create the boxplot with statistical comparison
+p1 <- ggplot(data, aes(x = CpGs_TFBS, y = (value), fill = CpGs_TFBS)) +
+  geom_boxplot(width = 0.3, color = "black", alpha = 0.3, outlier.color = "red") +
+  stat_compare_means(method = "wilcox.test", size = 5, label.y = 3.3, label.x = 1.3) + 
+  theme(axis.title.x = element_text(size = 16),  
+        axis.title.y = element_text(size = 16),  
+        axis.text.x = element_text(size = 15),   
+        axis.text.y = element_text(size = 15),
+        panel.background = element_rect(fill = "white", color = NA),
+        legend.position = "none") +
+  labs(title = "",
+       x = "Group",
+       y = "Standard_deviations") +
+  scale_fill_manual(values = custom_colors)
+
+p2 <- ggplot(data, aes(x = value, y = 1, fill = CpGs_TFBS, group = CpGs_TFBS)) +
+  geom_density_ridges(alpha = 0.3, scale = 1, rel_min_height = 0.01) +  # Overlapping densities
+  labs(title = "CpG_target_genes_deviation_with_age",
+    x = "Standard_deviations",
+    y = "Density") +
+  theme(axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    axis.text.x  = element_text(size = 15),
+    axis.text.y  = element_text(size = 15),
+    panel.background = element_rect(fill = "white", color = NA),  # clean background
+    panel.grid.major = element_blank(),  # remove major grid
+    panel.grid.minor = element_blank(),  # remove minor grid
+    axis.ticks = element_line(color = "black"), # keep tick marks
+    axis.line = element_line(color = "black"),  # add axis lines
+    legend.position = "right") +
+  scale_fill_manual(values = custom_colors) +
+  scale_x_break(c(1.5, 3))
+
+p2 + p1 + plot_layout(ncol = 2, widths = c(1.5, 0.7))
+
+```
+
+## The enrichment of age-associated CpGs in TFBSs - Figure 3
+
+Find TFs whose multiple sites are getting affected by age correlated CpGs - overlap and enrichment analysis
+
+```{r Figure 3, fig.width=18, fig.height=15, warning=FALSE}
+
+# Loading CpG–TFBS mapping, array CpGs, regulatory CpGs, and CpGs to exclude (high SD)
+cpg_to_TF <- as.data.frame(fread("./Data/CpGs_to_TFBS.bed"))
+array_cpgs <- readRDS("./Data/array_cpgs.rds")
+regulatory_cpgs <- readRDS("./Data/regulatory_cpgs.rds")
+cpg_filter <- readRDS("./Data/CpGs_to_remove_for_high_sd.rds")
+
+# Define the background set of CpGs to be tested
+# Keep CpGs present on array, in regulatory regions, and not filtered out for high sd 
+cpgs_test_all <- intersect(array_cpgs, regulatory_cpgs)
+cpgs_test_all <- setdiff(cpgs_test_all, cpg_filter)
+
+# Subset CpG–TFBS mappings to tested CpGs only
+cpg_to_TF_tested <- cpg_to_TF %>% filter(V6 %in% cpgs_test_all)
+
+# Convert tested CpG–TFBS mappings into GRanges for genomic operations
+cpg_to_TF_tested_gr <- GRanges(
+  seqnames = cpg_to_TF_tested$V1,
+  ranges = IRanges(start = cpg_to_TF_tested$V2, end = cpg_to_TF_tested$V3),
+  CpG = cpg_to_TF_tested$V6, TF = cpg_to_TF_tested$V7)
+
+# Define aging-associated CpGs
+# Load CpGs significantly associated with aging
+top_cpgs <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+
+# Filter CpG–TFBS mappings to aging-associated CpGs
+cpg_to_TF_aging <- cpg_to_TF %>% filter(V6 %in% top_cpgs)
+
+# Convert aging CpG–TFBS mappings into GRanges
+cpg_to_TF_aging_gr <- GRanges(
+  seqnames = cpg_to_TF_aging$V1,
+  ranges = IRanges(start = cpg_to_TF_aging$V2, end = cpg_to_TF_aging$V3),
+  CpG = cpg_to_TF_aging$V6, TF = cpg_to_TF_aging$V7)
+
+# Helper function to count non-overlapping TFBS per TF
+# For each TF, reduce overlapping ranges and count unique TFBS
+non_overlapping_counts <- function(gr, tf_column = "TFs"){
+  gr_split <- split(gr, mcols(gr)[[tf_column]])
+  counts <- sapply(gr_split, function(gr_subset) {
+    length(GenomicRanges::reduce(gr_subset))
+  })
+  return(counts)}
+
+# Enrichment of TFBS affected by aging CpGs
+# Non-overlapping TFBS counts for aging CpGs
+result <- non_overlapping_counts(cpg_to_TF_aging_gr, tf_column = "TF")
+result <- as.data.frame(result)
+
+# Non-overlapping TFBS counts for all tested CpGs (background)
+result_bg <- non_overlapping_counts(cpg_to_TF_tested_gr, tf_column = "TF")
+result_bg <- as.data.frame(result_bg)
+
+# Compute ratio of affected TFBS (aging vs background) and filter TFs
+ratio_TFBS_affected <- merge(result_bg, result, by = "row.names", all = TRUE)
+ratio_TFBS_affected[is.na(ratio_TFBS_affected)] <- 0
+ratio_TFBS_affected$ratio <- ratio_TFBS_affected$result / ratio_TFBS_affected$result_bg
+# Removing TFs with very low or very high number of CpG overlap TFBS
+ratio_TFBS_affected <- ratio_TFBS_affected %>% filter(result_bg > 100 & result_bg <= 10000)
+
+# Data frame used for plotting observed enrichment
+df_plot <- data.frame(
+  TF = ratio_TFBS_affected$Row.names,
+  Count = as.numeric(ratio_TFBS_affected$ratio))
+
+# ----------------------------
+
+# Permutation analysis
+# Use non-aging CpGs to generate null distributions
+cpgs_test <- setdiff(cpgs_test_all, top_cpgs)
+
+# Container for random ratios across iterations
+df_test <- data.frame(matrix(ncol = 0, nrow = length(unique(df_plot$TF))))
+
+for (i in 1:100) {
+  
+  # Sample random CpGs matching the number of aging CpGs
+  set.seed(i)
+  random_sample <- sample(cpgs_test, length(top_cpgs), replace = FALSE)
+  
+  # Subset CpG–TFBS mappings to random CpGs
+  cpg_to_TF_random <- cpg_to_TF %>% filter(V6 %in% random_sample)
+  
+  # Convert to GRanges
+  cpg_to_TF_random_gr <- GRanges(
+    seqnames = cpg_to_TF_random$V1,
+    ranges = IRanges(start = cpg_to_TF_random$V2, end = cpg_to_TF_random$V3),
+    CpG = cpg_to_TF_random$V6, TF = cpg_to_TF_random$V7)
+  
+  # Count non-overlapping TFBS per TF for random CpGs
+  result_random <- non_overlapping_counts(cpg_to_TF_random_gr, tf_column = "TF")
+  result_random <- as.data.frame(result_random)
+  
+  # Compute random ratios relative to background
+  ratio_TFBS_affected_random <- merge(result_bg, result_random, by = "row.names", all = TRUE)
+  ratio_TFBS_affected_random[is.na(ratio_TFBS_affected_random)] <- 0
+  ratio_TFBS_affected_random$ratio <- ratio_TFBS_affected_random$result_random / ratio_TFBS_affected_random$result_bg
+  ratio_TFBS_affected_random <- ratio_TFBS_affected_random %>% filter(result_bg > 100 & result_bg <= 10000)
+  
+  # Store ratios for this iteration
+  colname <- paste("Itr", i, sep = "_")
+  df_test <- cbind(df_test, ratio_TFBS_affected_random$ratio)
+  colnames(df_test)[ncol(df_test)] <- colname
+}
+
+# Reformat simulation results
+rownames(df_test) <- ratio_TFBS_affected_random$Row.names
+df_test <- as.data.frame(t(df_test))
+
+# Mean random ratio per TF
+Count_random <- apply(df_test, 2, mean, na.rm = TRUE)
+Count_random <- as.data.frame(Count_random)
+Count_random$TF <- rownames(Count_random)
+
+# Combine observed and random results for plotting
+df_plot <- merge(df_plot, Count_random, by = "TF")
+df_plot <- df_plot %>% arrange(desc(Count))
+
+# Select top and bottom TFs for visualization
+df_plot_sub <- df_plot[c(1:20, (nrow(df_plot)-20):nrow(df_plot)), ]
+
+# Bar plot comparing observed vs random enrichment
+plt1 <- ggplot(df_plot_sub, aes(x = reorder(TF, Count))) +
+  geom_bar(aes(y = Count, fill = "Age correlated"), stat = "identity", width = 0.7) +
+  geom_bar(aes(y = Count_random, fill = "Random"), stat = "identity", width = 0.5) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = "CpGs_in_TFBS",
+       x = "Transcription Factor (TF)",
+       y = "Proportion_TFBS_Sites_Affected",
+       fill = "Legend") + 
+  theme(plot.title = element_text(size = 22), 
+        axis.title = element_text(size = 20),              
+        axis.text = element_text(size = 22),               
+        legend.text = element_text(size = 20),            
+        legend.title = element_text(size = 18),
+        legend.key.size = unit(1.2, "cm"), legend.position = "right") +
+  scale_fill_manual(values = c("Age correlated" = "#993D00", "Random" = "#FFCA99"),
+                    name = "CpG_class")
+
+# ----------------------------
+
+# Statistical testing of enrichment
+# Restrict to plotted TFs
+df_plot <- df_plot_sub
+TFs <- df_plot_sub$TF
+df_test <- df_test[, TFs]
+
+# Observed values per TF
+single_values <- setNames(as.list(df_plot$Count), df_plot$TF)
+
+# Test observed value against random distribution per TF
+evaluate_column <- function(column_data, single_value) {
+  shapiro_result <- shapiro.test(column_data)
+  p_normality <- shapiro_result$p.value
+  
+  if (p_normality > 0.05) {
+    mean_val <- mean(column_data)
+    sd_val <- sd(column_data)
+    z_score <- (single_value - mean_val) / sd_val
+    p_value <- 2 * (1 - pnorm(abs(z_score)))
+    method <- "Parametric"
+  } else {
+    rank_data <- rank(c(column_data, single_value))# ----------------------------
+    single_value_rank <- rank_data[length(rank_data)]
+    p_value <- single_value_rank / length(rank_data)
+    method <- "Non-Parametric"
+  }
+  
+  return(list(
+    method = method,
+    normality_p = p_normality,
+    p_value = p_value
+  ))
+}
+
+# Apply tests across TFs
+results <- mapply(evaluate_column, df_test, single_values, SIMPLIFY = FALSE)
+
+# Summarize statistical results
+results_df <- do.call(rbind, lapply(names(results), function(col_name) {
+  cbind(Column = col_name, 
+        Method = results[[col_name]]$method, 
+        Normality_p = results[[col_name]]$normality_p, 
+        SingleValue_p = results[[col_name]]$p_value)}))
+
+results_df <- as.data.frame(results_df, stringsAsFactors = FALSE)
+results_df$Normality_p <- as.numeric(results_df$Normality_p)
+results_df$SingleValue_p <- as.numeric(results_df$SingleValue_p)
+results_df$adjusted_p_values <- p.adjust(results_df$SingleValue_p, method = "BH")
+
+# Density ridge plots of random distributions
+# Build density data for each TF
+data_list <- apply(df_test, 2, function(x) {
+  density_data <- density(x)
+  data.frame(x = density_data$x, y = density_data$y)
+})
+
+density_df <- do.call(rbind, Map(function(df, i) {
+  df$Group <- i  
+  df
+}, data_list, seq_along(data_list)))
+
+density_df$Group <- factor(density_df$Group, levels = rev(seq_along(data_list)), labels = rev(TFs))
+
+# Add observed values as vertical lines
+named_vector <- setNames(df_plot$Count, df_plot$TF)
+density_df$Value <- named_vector[as.character(density_df$Group)]
+
+# Restrict to significant TFs
+results_df_filtered <- results_df[results_df$adjusted_p_values < 0.05, ]
+df_test_filtered <- df_test[, results_df_filtered$Column]
+
+data_list <- apply(df_test_filtered, 2, function(x) {
+  density_data <- density(x)
+  data.frame(x = density_data$x, y = density_data$y)
+})
+
+density_df_fil <- do.call(rbind, Map(function(df, i) {
+  df$Group <- i  
+  df
+}, data_list, seq_along(data_list)))
+
+density_df_fil$Group <- factor(
+  density_df_fil$Group,
+  levels = rev(seq_along(data_list)),
+  labels = rev(colnames(df_test_filtered))
+)
+
+df_plot_filtered <- df_plot %>% filter(TF %in% colnames(df_test_filtered))
+named_vector <- setNames(df_plot_filtered$Count, df_plot_filtered$TF)
+density_df_fil$Value <- named_vector[as.character(density_df_fil$Group)]
+
+# Mark significant TFs
+pval_df <- data.frame(
+  Group = unique(density_df_fil$Group),
+  p_value = round(results_df_filtered$SingleValue_p, digits = 4)
+)
+
+density_df$color <- ifelse(density_df$Group %in% pval_df$Group, "Yes", "NA")
+
+# Density ridge plot with observed enrichment marked
+plt2 <- ggplot(density_df, aes(x = x, y = Group, height = y)) +
+  geom_density_ridges(stat = "identity", alpha = 0.75, fill = "grey") +  
+  geom_segment(aes(x = Value, xend = Value, 
+                   y = as.numeric(Group) - 0.4,
+                   yend = as.numeric(Group) + 0.4,
+                   color = color), size = 1) +
+  scale_color_manual(values = c("Yes" = "#993D00", "NA" = "black"), 
+                     name = "Significance_(padj < 0.05)",
+                     labels = c("Yes" = "Significant", "NA" = "Non-significant")) + 
+  theme_minimal() +
+  theme(plot.title = element_text(size = 22), 
+        axis.title = element_text(size = 20),              
+        axis.text = element_text(size = 22),               
+        legend.text = element_text(size = 20),            
+        legend.title = element_text(size = 18),
+        legend.key.size = unit(1.2, "cm"), 
+        axis.title.y = element_blank(), 
+        axis.text.y = element_blank(), 
+        legend.position = "right") +
+  labs(title = "Significance_of_enrichment",
+       x = "Proportion_TFBS_Sites_Affected",
+       y = "Transcription Factor (TF)")
+
+# Combine final plots
+plt1 + plt2 + plot_layout(ncol = 2, widths = c(1, 1), guides = "collect")
+
+```
+
+##  Development and performance of TFMethyl Clock – TFBS-based epigenetic clock model - Figure 4B
+
+70-30 train-test split performance with optimized clustering parameters 
+
+```{r Figure 4B}
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+# # Read the beta matrix from CSV
+# beta_mat <- fread("./Data/beta_matrix.csv")
+# 
+# # Load validation sample IDs from another dataset
+# validation_samples <- readRDS("./Data/Validation_samples.rds")
+# 
+# # removing validation cohort from the split
+# beta_mat_train <- beta_mat[!beta_mat$SampleID %in% validation_samples, ]
+# 
+# # performing test-train split
+# set.seed(50)
+# test_indices <- as.numeric(createDataPartition(beta_mat_train$age, p = 0.3, list = FALSE))
+# 
+# test_data <- beta_mat_train[test_indices, ]  
+# train_data <- beta_mat_train[-test_indices, ]
+# 
+# # keeping actual ages from test and train splits
+# test_data_age <- as.numeric(test_data$age)
+# train_data_age <- as.numeric(train_data$age)
+# test_data$age <- NULL
+# train_data$age <- NULL
+# 
+# # prepare test split structure in desired form 
+# test_data <- as.data.frame(t(test_data))
+# colnames(test_data) <- test_data[1, ]
+# test_data <- test_data[-1, ]
+# test_data <- test_data %>% mutate_if(is.character, ~ as.numeric(.))
+# 
+# # prepare train split structure in desired form 
+# train_data <- as.data.frame(t(train_data))
+# colnames(train_data) <- train_data[1,]
+# train_data <- train_data[-1, ]
+# train_data <- train_data %>% mutate_if(is.character, ~ as.numeric(.))
+# 
+# # applying features selection with pre-filtered cpgs
+# to_filter <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+# subset_beta_train <- train_data[rownames(train_data) %in% to_filter, ]
+# 
+# # Function to perform k-means clustering on CpGs and aggregate clusters using median
+# feature_selection <- function(subset_beta_train, k){
+#   
+#   # k-means clustering of cpgs based on their similarity of methylation change
+#   set.seed(123)
+#   clustering_result <- kmeans(subset_beta_train, centers = k)
+#   
+#   # Attach cluster labels to CpGs
+#   subset_beta_train <- cbind(cluster = clustering_result$cluster, subset_beta_train)
+#   
+#   # Aggregate CpGs within each cluster using the median
+#   subset_beta_train_M <- aggregate(. ~ cluster, data = subset_beta_train, FUN = median)
+#   
+#   # Store cluster assignments for each CpG
+#   cluster_info <- subset_beta_train[, "cluster", drop = FALSE]
+#   
+#   return(list(
+#     subset_beta_train_M = subset_beta_train_M,
+#     cluster_info = cluster_info
+#   ))
+# }
+# 
+# # applying feature clustering function
+# subset_beta_train_M <- feature_selection(subset_beta_train, 4800)
+# subset_beta_train_mat <- subset_beta_train_M$subset_beta_train_M
+# subset_beta_train_mat$cluster <- NULL
+# rownames(subset_beta_train_mat) <- paste("cluster", seq_len(nrow(subset_beta_train_mat)), sep = " ")
+# 
+# # training the model
+# set.seed(123)
+# model <- cv.glmnet(x = as.matrix(t(subset_beta_train_mat)), y = log(as.numeric(train_data_age) + 1), nfolds = 30, alpha = 0.1, family = "gaussian")
+# 
+# cluster_info <- subset_beta_train_M$cluster_info
+# 
+# # preparing data structure for the test fold to predict
+# subset_beta_test_mat <- test_data[rownames(test_data) %in% rownames(subset_beta_train_M$cluster_info), ]
+# subset_beta_test_mat <- subset_beta_test_mat[match(rownames(subset_beta_train_M$cluster_info), rownames(subset_beta_test_mat)), ]
+# subset_beta_test_mat <- cbind(cluster = subset_beta_train_M$cluster_info$cluster, subset_beta_test_mat)
+# subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+# subset_beta_test_mat$cluster <- NULL
+# 
+# # predicting using trained model
+# y_pred <- as.numeric(predict(model, t(subset_beta_test_mat)))
+# 
+# # preparing final data frame for plotting 
+# predictor_vector <- as.numeric(y_pred)
+# response_vector <- as.numeric(test_data_age)
+# predictor_vector <- exp(predictor_vector) - 1
+# 
+# corr <- data.frame(predictor_vector, response_vector)
+# write.csv(corr, "./Data/test_split_results.csv")
+
+#-----------------------------------------------------------------------------------
+
+corr <- read.csv("./Data/test_split_results.csv")
+
+# the reported matrices
+cor_test_result <- cor(corr$predictor_vector, corr$response_vector)
+error <- round(median(abs(corr$predictor_vector - corr$response_vector)), digits = 2)
+rmse <- sqrt(mean((corr$response_vector - corr$predictor_vector)^2))
+
+# metrics to plot with scatter plot
+metric_log_clustering_CV_base <- paste("Correlation:", as.character(round(cor_test_result, digits = 2)),";", "\n", 
+                                       "MdAE:", as.character(error), ";", "\n", 
+                                       "RMSE:", round(rmse, digits = 2))
+
+# plotting
+ggplot(corr, aes(x = response_vector, y = predictor_vector)) +
+  geom_point_rast(alpha = 0.5, size = 2) +
+  geom_smooth(method = "lm", se = TRUE, color = "blue", linetype = "solid") + 
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  annotate("text", x = 22, y = max(corr$predictor_vector) - 10, label = metric_log_clustering_CV_base, size = 5, colour = "black") +
+  labs(title = "", x = "Chronological Age (years)", y = "Predicted Age (years)") + 
+  theme(plot.title = element_text(size = 18), axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 20),
+        axis.text.x = element_text(size = 20, color = "black"), axis.text.y = element_text(size = 20, color = "black"),
+        panel.background = element_rect(fill = "white"), panel.grid.major = element_line(color = "gray", linetype = "dotted"), legend.position = "none")
+
+```
+
+## Training the final TFMethyl model with optimized clustering parameters, without the validation cohort
+
+```{r}
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+# # Read the beta matrix from CSV
+# beta_mat <- fread("./Data/beta_matrix.csv")
+# 
+# # Load validation sample IDs
+# validation_samples <- readRDS("./Data/Validation_samples.rds")
+# 
+# # Separate validation cohort
+# beta_mat_validation <- beta_mat[beta_mat$SampleID %in% validation_samples, ]
+# 
+# # Keep remaining samples for training
+# beta_mat_train <- beta_mat[!beta_mat$SampleID %in% validation_samples, ]
+# 
+# # Extract training data and age vector
+# train_data <- beta_mat_train
+# train_data_age <- as.numeric(beta_mat_train$age)
+# 
+# # Remove age from predictors
+# train_data$age <- NULL
+# 
+# # Transpose so CpGs are rows and samples are columns
+# train_data <- as.data.frame(t(train_data))
+# 
+# # Set first row as column names and remove it
+# colnames(train_data) <- train_data[1, ]
+# train_data <- train_data[-1, ]
+# 
+# # Convert all values to numeric
+# train_data <- train_data %>% mutate_if(is.character, ~ as.numeric(.))
+# 
+# # Load pre-selected CpGs (e.g., top correlated TFBS CpGs)
+# to_filter <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+# 
+# # Subset training data to selected CpGs only
+# subset_beta_train <- train_data[rownames(train_data) %in% to_filter, ]
+# 
+# # Function to perform k-means clustering on CpGs and aggregate clusters using median
+# feature_selection <- function(subset_beta_train, k){
+#   set.seed(123)
+#   clustering_result <- kmeans(subset_beta_train, centers = k)
+#   subset_beta_train <- cbind(cluster = clustering_result$cluster, subset_beta_train)
+#   subset_beta_train_M <- aggregate(. ~ cluster, data = subset_beta_train, FUN = median)
+#   cluster_info <- subset_beta_train[, "cluster", drop = FALSE]
+#   return(list(subset_beta_train_M = subset_beta_train_M, cluster_info = cluster_info))}
+# 
+# # Cluster CpGs and obtain aggregated cluster features
+# subset_beta_train_M <- feature_selection(subset_beta_train, 4800)
+# subset_beta_train_mat <- subset_beta_train_M$subset_beta_train_M
+# 
+# # Remove cluster column and define row names
+# subset_beta_train_mat$cluster <- NULL
+# rownames(subset_beta_train_mat) <- paste("cluster", seq_len(nrow(subset_beta_train_mat)), sep = " ")
+# 
+# # Fit elastic net model with cross-validation
+# set.seed(123)
+# model <- cv.glmnet(
+#   x = as.matrix(t(subset_beta_train_mat)),
+#   y = log(as.numeric(train_data_age) + 1),
+#   nfolds = 30,
+#   alpha = 0.1,
+#   family = "gaussian")
+# 
+# # Extract cluster assignment information
+# cluster_info <- subset_beta_train_M$cluster_info
+# 
+# # Save trained model and CpG-to-cluster mapping
+# saveRDS(model, "./Data/model_trainsplit.rds")
+# saveRDS(cluster_info, "./Data/cluster_info.rds")
+
+#-----------------------------------------------------------------------------------
+```
+
+## Development and performance of TFMethyl Clock – TFBS-based epigenetic clock model - Figure 4D
+
+Sequential replacement of 10, 20, 30, and 40% CpG probe measurements with random values drawn from fitted beta distributions in the validation cohort, checking for prediction performance from clock models.
+
+Iterate over selected CpG sites and model each column with a Beta distribution.
+For each CpG, compute the empirical mean and variance from the valid_data matrix, estimate the corresponding Beta distribution parameters (alpha, beta), generate new Beta-distributed values with the same moments, and replace the original column values with the simulated data.
+
+```{r Figure 4D, fig.width=10, fig.height=5, warning=FALSE}
+
+# Read the beta matrix data from a CSV file
+beta_mat <- fread("./Data/beta_matrix.csv")
+
+# Load validation sample IDs from another dataset
+validation_samples <- readRDS("./Data/Validation_samples.rds")
+
+# removing validation cohort from the split
+valid_data <- beta_mat[beta_mat$SampleID %in% validation_samples, ]
+
+# getting the actual age of the samples
+age <- valid_data$age
+valid_data$age <- NULL
+
+#for GP-clock run
+to_save <- data.table::transpose(valid_data, keep.names = "row.names", make.names = "SampleID")
+write_csv(to_save, "./Data/validation_meth.csv")
+
+# run the custom GP-age prediction script and get predictions
+path <- getwd()
+setwd(paste0(path, "/Data/GP-age/"))
+cmd <- paste("python3", paste0(path, "/Data/GP-age/predict_age.py"), "-x", paste0(path, "/Data/validation_meth.csv"), "-o", paste0(path, "/Data/"), "-m", "71")
+system(cmd)
+setwd(path)
+
+Gaussian <- read.csv("./Data/GP-age_71_cpgs_predictions.csv")$predictions
+
+# sub-setting in required data structure
+test_data <- as.data.frame(t(valid_data))
+colnames(test_data) <- test_data[1, ]
+test_data <- test_data[-1, ]
+test_data <- test_data %>% mutate_if(is.character, ~ as.numeric(.))
+  
+#loading the model and cluster information
+model <- readRDS("./Data/model_trainsplit.rds")
+cluster_info <- readRDS("./Data/cluster_info.rds")
+
+# preparing the validation data for running TFMethyl model
+subset_beta_test_mat <- test_data[rownames(test_data) %in% rownames(cluster_info), ]
+subset_beta_test_mat <- subset_beta_test_mat[match(rownames(cluster_info), rownames(subset_beta_test_mat)), ]
+subset_beta_test_mat <- cbind(cluster = cluster_info$cluster, subset_beta_test_mat)
+subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+subset_beta_test_mat$cluster <- NULL
+y_pred <- as.numeric(predict(model, t(subset_beta_test_mat)))
+
+predictor_vector <- as.numeric(y_pred)
+Our <- exp(predictor_vector) - 1
+
+#for later use-case
+to_save <- as.data.frame(cbind(SampleID = validation_samples, Predictions = Our))
+write_csv(to_save, "./Data/validation_split_results.csv")
+
+#putting sampleID in rownames for further predictions
+valid_data <- valid_data %>% column_to_rownames(var = "SampleID")
+
+# Estimate Beta distribution parameters (alpha and beta) from the mean (mu) and variance (var) using method-of-moments formulas. The function computes the shape parameters assuming mu is in (0,1) and returns them as a list.
+estBetaParams <- function(mu, var) {
+  alpha <- ((1 - mu) / var - 1 / mu) * mu ^ 2
+  beta <- alpha * (1 / mu - 1)
+  return(params = list(alpha = alpha, beta = beta))}
+
+# grabbing the first 10% of cpgs to add noise; 25403 corresponds to roughly 10% of all features in the beta matrix 
+set.seed(123)  
+subset_cpgs <- sample(colnames(valid_data), 25403)
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------
+# for (i in subset_cpgs){
+#   random_element_1 <- i
+#   x <- valid_data[[random_element_1]]
+#   mu = mean(x)
+#   sd = sd(x)
+#   var = sd^2 
+#   est <- estBetaParams(mu = mu, var = var)
+#   new_beta1 <- rbeta(665, est$alpha, est$beta, ncp = 0)
+#   valid_data[, random_element_1] <- new_beta1
+#   print(i)}
+# 
+# # save the new beta matrix
+# save <- as.data.frame(t(valid_data))
+# write.csv(save, "./Data/GP-age/noise10.csv", row.names = TRUE)
+#-----------------------------------------------------------------
+
+# run the custom GP-age prediction script on new beta matrix and read predictions
+path <- getwd()
+setwd(paste0(path, "/Data/GP-age/"))
+cmd <- paste("python3", paste0(path, "/Data/GP-age/predict_age.py"), "-x", paste0(path, "/Data/GP-age/noise10.csv"), "-o", paste0(path, "/Data/GP-age/"), "-m", "71")
+system(cmd)
+setwd(path)
+
+Gaussian_mod <- read.csv("./Data/GP-age/GP-age_71_cpgs_predictions.csv")$predictions
+
+# predict from TFMethyl clock
+# load the pre-computed beta matrix
+subset_beta_test_mat <- fread("./Data/GP-age/noise10.csv")
+subset_beta_test_mat <- subset_beta_test_mat |> column_to_rownames("V1") |> as.matrix()
+subset_beta_test_mat <- subset_beta_test_mat[rownames(subset_beta_test_mat) %in% rownames(cluster_info), ]
+subset_beta_test_mat <- subset_beta_test_mat[match(rownames(cluster_info), rownames(subset_beta_test_mat)), ]
+subset_beta_test_mat <- cbind(cluster = cluster_info$cluster, as.data.frame(subset_beta_test_mat))
+subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+subset_beta_test_mat$cluster <- NULL
+Our_mod <- as.numeric(predict(model, t(subset_beta_test_mat)))
+Our_mod <- exp(Our_mod) - 1
+
+#--------------
+
+# again the same procedure for 10% more CpGs
+set.seed(123)  
+subset_cpgs_second <- sample(setdiff(colnames(valid_data), subset_cpgs), 25403)
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------
+# for (i in subset_cpgs_second){
+#   random_element_1 <- i
+#   x <- valid_data[[random_element_1]]
+#   mu = mean(x)
+#   sd = sd(x)
+#   var = sd^2 
+#   est <- estBetaParams(mu = mu, var = var)
+#   new_beta1 <- rbeta(665, est$alpha, est$beta, ncp = 0)
+#   valid_data[, random_element_1] <- new_beta1
+#   print(i)}
+# 
+# save <- as.data.frame(t(valid_data))
+# write.csv(save, "./Data/GP-age/noise20.csv", row.names = TRUE)
+#-----------------------------------------------------------------
+
+path <- getwd()
+setwd(paste0(path, "/Data/GP-age/"))
+cmd <- paste("python3", paste0(path, "/Data/GP-age/predict_age.py"), "-x", paste0(path, "/Data/GP-age/noise20.csv"), "-o", paste0(path, "/Data/GP-age/"), "-m", "71")
+system(cmd)
+setwd(path)
+
+Gaussian_mod_mod <- read.csv("./Data/GP-age/GP-age_71_cpgs_predictions.csv")$predictions
+
+subset_beta_test_mat <- fread("./Data/GP-age/noise20.csv")
+subset_beta_test_mat <- subset_beta_test_mat |> column_to_rownames("V1") |> as.matrix()
+subset_beta_test_mat <- subset_beta_test_mat[rownames(subset_beta_test_mat) %in% rownames(cluster_info), ]
+subset_beta_test_mat <- subset_beta_test_mat[match(rownames(cluster_info), rownames(subset_beta_test_mat)), ]
+subset_beta_test_mat <- cbind(cluster = cluster_info$cluster, as.data.frame(subset_beta_test_mat))
+subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+subset_beta_test_mat$cluster <- NULL
+Our_mod_mod <- as.numeric(predict(model, t(subset_beta_test_mat)))
+Our_mod_mod <- exp(Our_mod_mod) - 1
+
+#--------------
+
+# again the same procedure for 10% more CpGs
+set.seed(123)  
+subset_cpgs_third <- sample(setdiff(colnames(valid_data), c(subset_cpgs, subset_cpgs_second)), 25403)
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------
+# for (i in subset_cpgs_third){
+#   random_element_1 <- i
+#   x <- valid_data[[random_element_1]]
+#   mu = mean(x)
+#   sd = sd(x)
+#   var = sd^2 
+#   est <- estBetaParams(mu = mu, var = var)
+#   new_beta1 <- rbeta(665, est$alpha, est$beta, ncp = 0)
+#   valid_data[, random_element_1] <- new_beta1
+#   print(i)}
+# 
+# save <- as.data.frame(t(valid_data))
+# write.csv(save, "./Data/GP-age/noise30.csv", row.names = TRUE)
+#-----------------------------------------------------------------
+
+path <- getwd()
+setwd(paste0(path, "/Data/GP-age/"))
+cmd <- paste("python3", paste0(path, "/Data/GP-age/predict_age.py"), "-x", paste0(path, "/Data/GP-age/noise30.csv"), "-o", paste0(path, "/Data/GP-age/"), "-m", "71")
+system(cmd)
+setwd(path)
+
+Gaussian_mod_mod_mod <- read.csv("./Data/GP-age/GP-age_71_cpgs_predictions.csv")$predictions
+
+subset_beta_test_mat <- fread("./Data/GP-age/noise30.csv")
+subset_beta_test_mat <- subset_beta_test_mat |> column_to_rownames("V1") |> as.matrix()
+subset_beta_test_mat <- subset_beta_test_mat[rownames(subset_beta_test_mat) %in% rownames(cluster_info), ]
+subset_beta_test_mat <- subset_beta_test_mat[match(rownames(cluster_info), rownames(subset_beta_test_mat)), ]
+subset_beta_test_mat <- cbind(cluster = cluster_info$cluster, as.data.frame(subset_beta_test_mat))
+subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+subset_beta_test_mat$cluster <- NULL
+Our_mod_mod_mod <- as.numeric(predict(model, t(subset_beta_test_mat)))
+Our_mod_mod_mod <- exp(Our_mod_mod_mod) - 1
+
+#--------------
+
+# again the same procedure for 10% more CpGs
+set.seed(123)  
+subset_cpgs_fourth <- sample(setdiff(colnames(valid_data), c(subset_cpgs, subset_cpgs_second, subset_cpgs_third)), 25403)
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------
+# for (i in subset_cpgs_fourth){
+#   random_element_1 <- i
+#   x <- valid_data[[random_element_1]]
+#   mu = mean(x)
+#   sd = sd(x)
+#   var = sd^2 
+#   est <- estBetaParams(mu = mu, var = var)
+#   new_beta1 <- rbeta(665, est$alpha, est$beta, ncp = 0)
+#   valid_data[, random_element_1] <- new_beta1
+#   print(i)}
+# 
+# save <- as.data.frame(t(valid_data))
+# write.csv(save, "./Data/GP-age/noise40.csv", row.names = TRUE)
+#-----------------------------------------------------------------
+
+path <- getwd()
+setwd(paste0(path, "/Data/GP-age/"))
+cmd <- paste("python3", paste0(path, "/Data/GP-age/predict_age.py"), "-x", paste0(path, "/Data/GP-age/noise40.csv"), "-o", paste0(path, "/Data/GP-age/"), "-m", "71")
+system(cmd)
+setwd(path)
+
+Gaussian_mod_mod_mod_mod <- read.csv("./Data/GP-age/GP-age_71_cpgs_predictions.csv")$predictions
+
+subset_beta_test_mat <- fread("./Data/GP-age/noise40.csv")
+subset_beta_test_mat <- subset_beta_test_mat |> column_to_rownames("V1") |> as.matrix()
+subset_beta_test_mat <- subset_beta_test_mat[rownames(subset_beta_test_mat) %in% rownames(cluster_info), ]
+subset_beta_test_mat <- subset_beta_test_mat[match(rownames(cluster_info), rownames(subset_beta_test_mat)), ]
+subset_beta_test_mat <- cbind(cluster = cluster_info$cluster, as.data.frame(subset_beta_test_mat))
+subset_beta_test_mat <- aggregate(. ~ cluster, data = subset_beta_test_mat, FUN = median)
+subset_beta_test_mat$cluster <- NULL
+Our_mod_mod_mod_mod <- as.numeric(predict(model, t(subset_beta_test_mat)))
+Our_mod_mod_mod_mod <- exp(Our_mod_mod_mod_mod) - 1
+
+#--------------
+
+# doing scatter plot with actual and predicted values 
+custom_colors <- c("Original_prediction" = "#FFCAAE", "with_10_percent_noise" = "#FFB68E", "with_20_percent_noise" = "#E76C2A", "with_30_percent_noise" = "#BA4C15", "with_40_percent_noise" = "#7B3014", "Actual" = "#009999")
+
+# Gaussian Plot
+to_plot_Gaussian <- as.data.frame(cbind(Original_prediction = Gaussian, with_10_percent_noise = Gaussian_mod,
+                                       with_20_percent_noise = Gaussian_mod_mod, with_30_percent_noise = Gaussian_mod_mod_mod, 
+                                       with_40_percent_noise = Gaussian_mod_mod_mod_mod, Actual = age))
+to_plot_Gaussian <- to_plot_Gaussian[order(to_plot_Gaussian$Actual), ]
+to_plot_Gaussian_long <- to_plot_Gaussian %>% pivot_longer(cols = -Actual, names_to = "Group", values_to = "Value")
+
+ggplot(to_plot_Gaussian_long, aes(x = Actual, y = Value, color = Group)) +
+  geom_point_rast(size = 1) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  geom_abline(intercept = 0, slope = 1, color = "#009999", linetype = "dashed") +
+  labs(title = "GP-clock",
+       x = "Chronological Age (years)", y = "Predicted Age (years)", color = "Group") + 
+  theme(plot.title = element_text(size = 18), axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 20),
+        axis.text.x = element_text(size = 22, color = "black"), axis.text.y = element_text(size = 22, color = "black"),
+        panel.background = element_rect(fill = "white"), panel.grid.major = element_line(color = "gray", linetype = "dotted"), legend.position = "none")
+
+# Our Plot
+to_plot_our <- as.data.frame(cbind(Original_prediction = Our, with_10_percent_noise = Our_mod, 
+                                   with_20_percent_noise = Our_mod_mod, with_30_percent_noise = Our_mod_mod_mod, 
+                                   with_40_percent_noise = Our_mod_mod_mod_mod, Actual = age))
+to_plot_our <- to_plot_our[order(to_plot_our$Actual), ]  
+
+to_plot_our_long <- to_plot_our %>% pivot_longer(cols = -Actual, names_to = "Group", values_to = "Value")
+
+ggplot(to_plot_our_long, aes(x = Actual, y = Value, color = Group)) +
+  geom_point_rast(size = 1) +
+  scale_color_manual(values = custom_colors) +
+  theme_minimal() +
+  geom_abline(intercept = 0, slope = 1, color = "#009999", linetype = "dashed") +
+  labs(title = "TFMethyl clock",
+       x = "Chronological Age (years)", y = "Predicted Age (years)", color = "Group") + 
+  theme(plot.title = element_text(size = 18), axis.title.x = element_text(size = 18), axis.title.y = element_text(size = 20),
+        axis.text.x = element_text(size = 22, color = "black"), axis.text.y = element_text(size = 22, color = "black"),
+        panel.background = element_rect(fill = "white"), panel.grid.major = element_line(color = "gray", linetype = "dotted"), legend.position = "none")
+
+
+# doing box plots with median errors 
+to_plot_Gaussian[] <- abs(to_plot_Gaussian - to_plot_Gaussian[, ncol(to_plot_Gaussian)])
+to_plot_our[] <- abs(to_plot_our - to_plot_our[, ncol(to_plot_our)])
+
+to_plot_Gaussian_long <- to_plot_Gaussian[, -ncol(to_plot_Gaussian)] %>%
+  gather(key = "Noise_level", value = "MAE") %>%
+  mutate(clock = "GP-clock", Noise_level = factor(Noise_level, levels = names(to_plot_Gaussian)))
+
+to_plot_our_long <- to_plot_our[, -ncol(to_plot_our)] %>%
+  gather(key = "Noise_level", value = "MAE") %>%
+  mutate(clock = "TFMethyl", Noise_level = factor(Noise_level, levels = names(to_plot_our)))
+
+df_combined <- bind_rows(to_plot_Gaussian_long, to_plot_our_long)
+#converting error to months
+df_combined$MAE <- df_combined$MAE * 12
+
+custom_colors <- c("#FFCAAE","#FFB68E","#E76C2A", "#BA4C15", "#7B3014")
+
+ggplot(df_combined, aes(x = clock, y = MAE, fill = Noise_level)) +
+  geom_boxplot(color = "black", size = 0.4, width = 0.5, position = position_dodge(width = 0.75)) +
+  stat_summary(fun = mean, geom = "text", aes(label = round(..y.., 2)), 
+               position = position_dodge(width = 0.75), vjust = 0.5, size = 4, color = "black") + 
+  scale_fill_manual(values = custom_colors) + 
+  theme_classic() +
+  theme(axis.text.x = element_text(hjust = 1, size = 20, color = "black"),  
+        axis.text.y = element_text(size = 20, color = "black"),  
+        axis.title.y = element_text(size = 22, color = "black"),  
+        legend.text = element_text(size = 10, color = "black"), legend.key.size = unit(0.4, "cm"), legend.position = "bottom", 
+        legend.title = element_blank()) +  
+  labs(x = "", y = "Errors (months)", title = "") + coord_flip()
+
+```
+
+## Development and performance of TFMethyl Clock – TFBS-based epigenetic clock model - Figure 4C & E
+
+Running methylation clocks on the validation cohort, absolute error analysis and errors over age analysis.
+
+```{r Figure 4C & E, fig.width=7, fig.height=5, fig.align="center", warning=FALSE}
+
+# Read the beta matrix data from a CSV file
+beta_mat <- fread("./Data/beta_matrix.csv")
+
+# Load validation sample IDs from another dataset
+validation_samples <- readRDS("./Data/Validation_samples.rds")
+
+# removing validation cohort from the split
+valid_data <- beta_mat[beta_mat$SampleID %in% validation_samples, ]
+
+# getting the actual age and removing it from the matrix
+age_vec <- valid_data$age
+valid_data$age <- NULL
+
+# preparing the matrix for predictions
+valid_data <- valid_data |>
+  column_to_rownames("SampleID") |>
+  as.matrix()
+
+#Phenoage clock
+Pheno_age <- calcPhenoAge(valid_data, imputation = F)
+
+#Hanuum-clock
+Hannum <- calcHannum(valid_data, imputation = F)
+
+#multi-tissue horvath clock
+Multi_tissue_hor <- calcHorvath1(valid_data, imputation = F)
+
+#skin and blood horvath clock
+skin_blood_hor <- calcHorvath2(valid_data, imputation = F)
+
+#epiTOC2 mitotic clock
+EpiTOC2 <- calcEpiTOC2(valid_data, imputation = F)
+
+#GrimAge2 prediction
+metadat_validation <- read.csv("./Data/Validation_metadata.csv")
+metadat_validation$sampleID <- gsub("^sentrixids:\\s*", "", metadat_validation$X.Sample_characteristics_ch1)
+metadat_validation$Sex <- gsub("^Sex:\\s*", "", metadat_validation$X.Sample_characteristics_ch1.1)
+metadat_validation$Age <- as.numeric(gsub("^age:\\s*", "", metadat_validation$X.Sample_characteristics_ch1.2))
+metadat_validation$Female <- ifelse(metadat_validation$Sex == "F", 0, 1)
+metadat_validation <- metadat_validation[metadat_validation$sampleID %in% rownames(valid_data), ]
+metadat_validation <- metadat_validation[match(rownames(valid_data), metadat_validation$sampleID), ]
+GrimAge2 <- calcGrimAgeV2(as.matrix(valid_data), pheno = metadat_validation[, c("sampleID", "Female", "Age")], ID = "sampleID")
+
+#combining predictions from clocks
+Score <- as.data.frame(cbind(Actual = age_vec, Pheno_age = Pheno_age, Hannum = Hannum, Multi_tissue_hor = Multi_tissue_hor, skin_blood_hor = skin_blood_hor, 
+               EpiTOC2 = EpiTOC2, GrimAge2=GrimAge2$GrimAgeV2))
+# correcting for the offset
+Score$EpiTOC2 <- Score$EpiTOC2 / 100
+
+# loading predictions from the GP-clock and TFMethyl clock
+Gaussian <- read_csv("./Data/GP-age_71_cpgs_predictions.csv")
+Ours <- read.csv("./Data/validation_split_results.csv")
+
+# combining predictions
+Clock_score <- cbind(Score, Gaussian = Gaussian$predictions, Ours = Ours$Predictions)
+colnames(Clock_score) <- c("Actual", "PhenoAge", "Hannum", "Horvarth1", "Horvarth2", "epiTOC2", "GrimAge2", "GPclock", "TFMethyl")
+
+# Get the column names excluding 'Actual'
+other_columns <- setdiff(names(Clock_score), "Actual")
+
+# Subtract Actual from each other column and store in separate vectors
+result_list <- lapply(other_columns, function(col) {
+  abs(Clock_score[[col]] - Clock_score$Actual)
+})
+names(result_list) <- other_columns
+
+# Convert list of vectors to a data frame with 'value' and 'group' columns
+data_df <- bind_rows(lapply(result_list, function(x) data.frame(value = x)), .id = "group")
+
+# Calculate medians for each group to label
+medians <- data_df %>% group_by(group) %>% summarize(median_value = median(value))
+
+# reordering for plotting
+data_df <- data_df %>% mutate(group = reorder(group, -value, FUN = median)) 
+
+# specifying colors
+custom_col <- c(rep("#f2f2f2ff", 7), "#ffe5ccff")
+
+ggplot(data_df, aes(x = group, y = value, fill = group)) +
+  geom_boxplot(outlier.shape = NA) +  # Boxplot without outliers
+  scale_fill_manual(values = custom_col) +  # Apply custom colors
+  geom_text(data = medians,
+    aes(x = group, y = median_value + 10, label = round(median_value, 2)),
+    color = "black", size = 5, fontface = "bold") +  # Median values on top
+  ylim(0, 50) +
+  labs(title = "Methylation_Aging_clock(s)_comparision",
+    x = "",
+    y = "Errors (years)") +
+  theme(legend.position = "none",
+    axis.title.x = element_text(size = 14), 
+    axis.title.y = element_text(size = 14), 
+    axis.text.x  = element_text(size = 10), 
+    axis.text.y  = element_text(size = 12),
+    panel.background = element_rect(fill = "white", color = NA),  # clean background
+    panel.grid.major = element_blank(),     
+    panel.grid.minor = element_blank(),
+    axis.ticks = element_line(color = "black"),  # show tick marks
+    axis.line.y = element_line(color = "black", size = 0.8),  # y-axis line
+    axis.line.x = element_line(color = "black", size = 0.8))
+
+#-------------------------------------------------------------------------------
+
+# arrange the data structure according to chronological age
+Clock_score <- Clock_score %>% arrange(desc(Actual))
+
+# Get the column names excluding 'Actual'
+other_columns <- Biostrings::setdiff(names(Clock_score), "Actual")
+
+# Subtract Actual from each other column and store in separate vectors, binding actual for final plotting
+result_list <- lapply(other_columns, function(col){abs(Clock_score[[col]] - Clock_score$Actual)})
+names(result_list) <- other_columns
+errors <- as.data.frame(result_list)
+errors <- cbind(Actual = Clock_score$Actual, errors)
+
+ggplot(errors, aes(x = Actual)) +
+  geom_smooth(aes(y = GPclock, color = "GPclock", fill = "GPclock"), method = "loess", se = TRUE) +
+  geom_smooth(aes(y = Horvarth2, color = "Horvath2", fill = "Horvath2"), method = "loess", se = TRUE) +
+  geom_smooth(aes(y = PhenoAge, color = "PhenoAge", fill = "PhenoAge"), method = "loess", se = TRUE) +
+  geom_smooth(aes(y = Hannum, color = "Hannum", fill = "Hannum"), method = "loess", se = TRUE) +
+  geom_smooth(aes(y = TFMethyl, color = "TFMethyl", fill = "TFMethyl"), method = "loess", se = TRUE) +
+  labs(title = "Prediction_accuracy_with_age", x = "Age (years)", y = "Prediction errors") +
+  scale_color_manual(name = "Clock", 
+                     values = c("TFMethyl" = "#b7703f", "Horvath2" = "#b3b3b3ff", "Hannum" = "#b3b3b3ff", "PhenoAge" = "#b3b3b3ff", "GPclock" = "#b3b3b3ff")) +
+  scale_fill_manual(name = "Clock", values = c("TFMethyl" = "#ffe7d3", "Horvath2" = "#f2f2f2ff", "Hannum" = "#f2f2f2ff", "PhenoAge" = "#f2f2f2ff", "GPclock" = "#f2f2f2ff")) +
+  theme_classic() + 
+  theme(axis.title.x = element_text(size = 14),     # Increase x-axis title font size
+        axis.title.y = element_text(size = 14),     # Increase y-axis title font size
+        axis.text.x = element_text(size = 12),      # Increase x-axis tick labels font size
+        axis.text.y = element_text(size = 12)) 
+
+```
+
+## Designing cross-validation to find all CV fold selected CpGs for further analysis
+
+CpGs selected in multiple CV folds demonstrate consistent age predictive performance, hence studied further for downstream gene-targets. 
+
+```{r}
+
+# NOTE:Un-comment and run this to test - computational and time expensive
+#-----------------------------------------------------------------------------------
+
+# # Read the beta matrix data from a CSV file
+# beta_mat <- fread("./Data/beta_matrix.csv")
+# 
+# # Set parameters for cross-validation and clustering
+# cv <- 10  # Number of folds
+# clusters <- 4800  # Number of clusters
+# set.seed(50)
+# folds <- createFolds(beta_mat$age, k = cv, list = TRUE, returnTrain = FALSE)
+# 
+# # Extract and remove 'age' column
+# data_age <- as.numeric(beta_mat$age)
+# beta_mat$age <- NULL
+# 
+# # Initialize list for storing results
+# coffs <- list()
+# 
+# # Perform k-fold cross-validation
+# for (i in 1:cv) {
+#   
+#   test_indices <- unlist(folds[i])
+#   train_indices <- setdiff(1:nrow(beta_mat), test_indices)
+#   
+#   train_data <- beta_mat[train_indices, ]
+#   
+#   # Transpose train data
+#   train_data <- as.data.frame(t(train_data))
+#   colnames(train_data) <- train_data[1, ]
+#   train_data <- train_data[-1, ] %>% mutate_if(is.character, as.numeric)
+#   
+#   print(i)
+#   
+#   # Load top age correlated TFBS CpGs
+#   to_filter <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+#   subset_beta_train <- train_data[rownames(train_data) %in% to_filter, ]
+#   
+#   # Feature selection function using k-means clustering
+#   feature_selection <- function(subset_beta_train, k) {
+#     set.seed(123)
+#     clustering_result <- kmeans(subset_beta_train, centers = k)
+#     subset_beta_train <- cbind(cluster = clustering_result$cluster, subset_beta_train)
+#     subset_beta_train_M <- aggregate(. ~ cluster, data = subset_beta_train, FUN = median)
+#     cluster_info <- subset_beta_train[, "cluster", drop = FALSE]
+#     return(list(subset_beta_train_M = subset_beta_train_M, cluster_info = cluster_info))
+#   }
+#   
+#   subset_beta_train_M <- feature_selection(subset_beta_train, clusters)
+#   subset_beta_train_mat <- subset_beta_train_M$subset_beta_train_M
+#   subset_beta_train_mat$cluster <- NULL
+#   rownames(subset_beta_train_mat) <- paste("cluster", seq_len(nrow(subset_beta_train_mat)), sep = " ")
+#   
+#   # Train elastic net regression model
+#   set.seed(123)
+#   model <- cv.glmnet(x = as.matrix(t(subset_beta_train_mat)), 
+#                       y = log(as.numeric(data_age[train_indices]) + 1), 
+#                       nfolds = 30, 
+#                       alpha = 0.1, 
+#                       family = "gaussian")
+#   
+#   # Extract model coefficients
+#   coefficients <- coef(model, s = model$lambda.min)
+#   coefficients <- as.matrix(coefficients)
+#   coefficients <- coefficients[coefficients[, 1] != 0, , drop = FALSE]
+#   coefficients_row_names <- gsub("^cluster ", "", rownames(coefficients))
+#   filtered_cluster <- subset_beta_train_M$cluster_info %>% filter(cluster %in% coefficients_row_names)
+#   filtered_cluster$CpGs <- rownames(filtered_cluster)
+#   rownames(coefficients) <- sub("cluster ", "", rownames(coefficients))
+#   coefficients <- coefficients[-1, , drop = FALSE]
+#   to_save <- merge(filtered_cluster, coefficients, by.x = "cluster", by.y = "row.names", all.x = TRUE)
+#   coffs[[i]] <- to_save
+# }
+#
+# # Save results
+# saveRDS(coffs, "./Data/10_fold_beta_coff_CV_results.rds")
+
+#-----------------------------------------------------------------------------------
+
+```
+
+## Target genes of age-predictive CpGs selected by TFMethyl Clock - Figure 5A. 
+
+Finding TFs whose binding sites are significantly enriched with CV CpGs, then finding their gene targets connected via CpGs, followed by gene-TF network analysis. 
+
+```{r Figure 5A, fig.width=12, fig.height=10, fig.align="center", warning=FALSE}
+
+# Load the RDS file
+coffs <- readRDS("./Data/10_fold_beta_coff_CV_results.rds")
+
+# Set row names for each data frame in the list based on the second column
+coffs <- lapply(coffs, function(df){
+  rownames(df) <- df[[2]]
+  df
+})
+# Identify row names that appear in at all elements
+common_rownames <- names(which(table(unlist(lapply(coffs, rownames))) >= 10))
+
+# Load CpG to TF mapping data
+cpg_to_TF <- fread("./Data/CpGs_to_TFBS.bed") %>% as.data.frame()
+
+# Aging affected TF sites
+cpg_to_TF_fil_selected <- cpg_to_TF %>% filter(V6 %in% common_rownames)
+
+# All TF sites as background input to the model
+to_filter <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+cpg_to_TF_fil_input_to_model <- cpg_to_TF %>% filter(V6 %in% to_filter)
+
+# Step 1: Get counts of each TF (V7) in selected and background sets
+selected_counts <- table(cpg_to_TF_fil_selected$V7)
+background_counts <- table(cpg_to_TF_fil_input_to_model$V7)
+
+# Combine both into a data frame
+all_TFs <- union(names(selected_counts), names(background_counts))
+
+enrichment_results <- data.frame(
+  TF = character(),
+  Selected = integer(),
+  Background = integer(),
+  p_value = numeric(),
+  stringsAsFactors = FALSE
+)
+
+# Total number of entries in selected and background
+total_selected <- nrow(cpg_to_TF_fil_selected)
+total_background <- nrow(cpg_to_TF_fil_input_to_model)
+
+# Step 2: Loop through each TF and perform Fisher's exact test
+for (tf in all_TFs) {
+  selected_tf <- ifelse(tf %in% names(selected_counts), selected_counts[tf], 0)
+  background_tf <- ifelse(tf %in% names(background_counts), background_counts[tf], 0)
+  
+  # Build contingency table:
+  #               In Selected | Not in Selected
+  # ------------ | ----------- | ----------------
+  # Has TF       | selected_tf | background_tf - selected_tf
+  # No TF        | total_selected - selected_tf | total_background - background_tf - (total_selected - selected_tf)
+
+  contingency_table <- matrix(c(
+    selected_tf,
+    background_tf - selected_tf,
+    total_selected - selected_tf,
+    (total_background - background_tf) - (total_selected - selected_tf)
+  ), nrow = 2, byrow = TRUE)
+
+  # Perform Fisher's test
+  test_result <- fisher.test(contingency_table, alternative = "greater")
+
+  # Store results
+  enrichment_results <- rbind(enrichment_results, data.frame(
+    TF = tf,
+    Selected = selected_tf,
+    Background = background_tf,
+    p_value = test_result$p.value,
+    stringsAsFactors = FALSE
+  ))
+}
+
+# Step 3: Adjust for multiple testing (FDR)
+enrichment_results$padj <- p.adjust(enrichment_results$p_value, method = "BH")
+
+# Maintain order for plotting, and taking top 15 TFs
+enrichment_results_sorted <- enrichment_results %>%
+  arrange(p_value) %>%
+  mutate(TF = factor(TF, levels = unique(TF)))  
+enrichment_results_sorted <- enrichment_results_sorted[c(1:15), ]
+
+print(enrichment_results_sorted)
+
+# Figure Supp9
+
+# ggplot(enrichment_results_sorted, aes(x = -log10(p_value), y = TF)) +
+#   geom_point(aes(size = Selected, color = p_value), alpha = 0.7) +
+#   scale_size_continuous(name = "CpGs overlap TFBS") +
+#   scale_color_gradient(low = "red",
+#     high = "blue",
+#     name = "p-value",
+#     trans = "log",
+#     labels = label_number(accuracy = 0.01)) +
+#   scale_x_reverse() +
+#   labs(title = "CV CpGs TFBS enrichment",
+#     x = expression(-log[10](p~value)),
+#     y = "Transcription Factors") +
+#   theme_minimal() +
+#   theme(axis.text.x = element_text(size = 12),
+#     axis.text.y = element_text(size = 16),
+#     axis.title.x = element_text(size = 14),  
+#     axis.title.y = element_text(size = 14),  
+#     plot.title = element_text(hjust = 0.5))
+
+#-------------------------------------------------------------------------------
+
+# A gene-TF network plot for top TFs in previous enrichment, connected by overlapping CpGs
+Sig_TFs <- c("ATF2", "EBF1", "NR2C2", "REST")
+
+cpg_to_TF_fil_selected_sig_TFs <- cpg_to_TF_fil_selected %>% filter(V7 %in% Sig_TFs)
+
+epic_annotation <- as.data.frame(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Other)
+subset_epic_annotation <- epic_annotation[epic_annotation$Methyl450_Loci %in% cpg_to_TF_fil_selected_sig_TFs$V6, ]
+
+# function to remove repeated gene name to one CpG
+remove_repeated_entries <- function(x) {
+  elements <- str_split(x, ";")[[1]]
+  unique_elements <- unique(elements)
+  return(paste(unique_elements, collapse = ";"))
+}
+
+# function to remove more than one gene target to a gene
+keep_one <- function(values) {
+  if (is.na(values) || values == "") {
+    return(NA)
+  }
+  elements <- unlist(strsplit(values, ";"))
+  if (length(elements) == 1) {
+    return(elements)
+  }
+  set.seed(50)
+  random_element <- sample(elements, 1)
+  return(random_element)
+}
+
+subset_epic_annotation_t <- subset_epic_annotation %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+subset_epic_annotation <- subset_epic_annotation_t %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, keep_one))
+subset_epic_annotation <- subset_epic_annotation[!is.na(subset_epic_annotation$UCSC_RefGene_Name), ]
+subset_epic_annotation <- subset_epic_annotation[, c("Methyl450_Loci", "UCSC_RefGene_Name")]
+
+cpg_to_TF_fil_selected_sig_TFs <- merge(cpg_to_TF_fil_selected_sig_TFs, subset_epic_annotation, by.x = "V6", by.y = "Methyl450_Loci")
+
+# Create interaction data
+interactions <- data.frame(
+  TF = cpg_to_TF_fil_selected_sig_TFs$V7,
+  Gene = cpg_to_TF_fil_selected_sig_TFs$UCSC_RefGene_Name)
+
+#gene expression of target genes with age
+tpm_blood <- fread("./Data/gene_tpm_2022-06-06_v10_whole_blood.gct", skip = 2) 
+tpm_blood_metadata <- fread("./Data/GTEx_Analysis_v10_Annotations_SubjectPhenotypesDS.txt") 
+tpm_blood$Name <- NULL
+tpm_blood <- as.data.frame(tpm_blood)
+filtered_tpm_blood <- tpm_blood[tpm_blood$Description %in% unique(c(interactions$Gene, interactions$TF)), ]
+filtered_tpm_blood <- filtered_tpm_blood %>% group_by(Description) %>% dplyr::summarize(across(everything(), mean, na.rm = TRUE))
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood)
+rownames(filtered_tpm_blood) <- filtered_tpm_blood$Description
+filtered_tpm_blood$Description <- NULL
+colnames(filtered_tpm_blood) <- substr(colnames(filtered_tpm_blood), 1, 10)
+filtered_tpm_blood <- as.data.frame(t(filtered_tpm_blood))
+tpm_blood_metadata$AGE <- as.numeric(substr(tpm_blood_metadata$AGE, 1, 2)) + 5
+tpm_blood_metadata <- tpm_blood_metadata %>% arrange(AGE)
+tpm_blood_metadata <- as.data.frame(tpm_blood_metadata %>% filter(SUBJID %in% rownames(filtered_tpm_blood)))
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood[tpm_blood_metadata$SUBJID, ])
+filtered_tpm_blood <- filtered_tpm_blood %>% rownames_to_column(var = "SUBJID")
+gene_expression <- tpm_blood_metadata %>% dplyr::select(SUBJID, AGE) %>% inner_join(filtered_tpm_blood, by = "SUBJID")
+gene_expression <- gene_expression %>% group_by(AGE) %>% summarise(across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+gene_expression <- as.data.frame(gene_expression)
+
+# calculating age correlations for corresponding genes
+spearman_results <- apply(gene_expression[, -1], 2, function(column) {
+  test <- cor.test(column, gene_expression$AGE, method = "spearman")
+  c(correlation = test$estimate, p_value = test$p.value)})
+spearman_results <- as.data.frame(t(spearman_results))
+spearman_results$genes <- rownames(spearman_results)
+
+# table combining expression correlations and TF-gene targets
+interactions <- merge(interactions, spearman_results, by.x ="Gene", by.y = "genes")
+interactions <- unique(interactions)
+interactions$correlation.rho[is.na(interactions$correlation.rho)] <- 0
+
+# Count TF occurrences
+tf_freq <- as.data.frame(table(interactions$TF))
+colnames(tf_freq) <- c("name", "tf_count")
+
+# Aggregate correlation.rho by gene
+gene_corr <- interactions %>%
+  group_by(Gene) %>%
+  summarise(correlation_rho = mean(correlation.rho, na.rm = TRUE)) %>%
+  rename(name = Gene)
+
+# Create edge list
+edges <- interactions %>%
+  distinct(TF, Gene) %>%
+  rename(from = TF, to = Gene)
+
+# Create graph
+graph <- tbl_graph(edges = edges, directed = TRUE)
+
+# Add node metadata
+graph <- graph %>%
+  activate(nodes) %>%
+  mutate(
+    tf_count = tf_freq$tf_count[match(name, tf_freq$name)],
+    tf_count = ifelse(is.na(tf_count), 1, tf_count),  # Default size for non-TFs
+    node_type = ifelse(name %in% interactions$TF, "TF", "Target"),
+    label_size = ifelse(node_type == "TF", 5, 4)) %>%
+  left_join(gene_corr, by = "name")  # Add correlation_rho to gene nodes
+
+# Plot with TFs as hexagons
+ggraph(graph, layout = "fr") +
+  geom_edge_link(color = "grey") +
+
+  # TF nodes (hexagon)
+  geom_node_point(
+    data = . %>% filter(node_type == "TF"),
+    aes(size = tf_count, fill = correlation_rho),
+    shape = 23, color = "black", stroke = 0.5
+  ) +
+
+  # Target nodes (circle)
+  geom_node_point(
+    data = . %>% filter(node_type == "Target"),
+    aes(size = tf_count, fill = correlation_rho),
+    shape = 21, color = "black", stroke = 0.5
+  ) +
+
+  geom_node_text(
+    aes(label = name,
+        fontface = ifelse(node_type == "TF", "bold", "plain"),
+        size = label_size),
+    repel = TRUE
+  ) + 
+  scale_fill_gradient2(
+    low = "#006666", mid = "white", high = "#662700", midpoint = 0,
+    na.value = "grey90", name = "Age_correlation"
+  ) +
+  scale_size_continuous(range = c(2, 10)) +
+  theme_void() +
+  labs(title = "Enriched_TF–Gene_Network", size = "TFs")
+
+```
+
+## Target genes of age-predictive CpGs selected by TFMethyl Clock - Figure 5B. 
+
+Enrichment analysis for target genes for 10 fold CV CpGs. 
+
+```{r Figure 5B, fig.width=8, fig.height=6, fig.align="center", warning=FALSE}
+
+# Load the RDS file
+coffs <- readRDS("./Data/10_fold_beta_coff_CV_results.rds")
+# Set row names for each data frame in the list based on the second column
+coffs <- lapply(coffs, function(df){
+  rownames(df) <- df[[2]]
+  df
+})
+# Identify row names that appear in all elements
+common_rownames <- names(which(table(unlist(lapply(coffs, rownames))) >= 10))
+
+# Subset each dataframe by the common row names and combine into a single dataframe
+coffs_common_df <- do.call(cbind, lapply(coffs, function(df) df[common_rownames, , drop = FALSE]))
+
+# Subset specific columns of interest
+coffs_common_df <- coffs_common_df[, seq(3, ncol(coffs_common_df), by = 3), drop = FALSE]
+
+# Calculate row medians
+coffs_common_df$avg <- rowMedians(as.matrix(coffs_common_df), na.rm = TRUE)
+
+# Create data frame with median values and row names
+cpg_coff <- data.frame(Coff = coffs_common_df$avg, Methyl450_Loci = common_rownames)
+
+# getting illumina annotations
+epic_annotation <- as.data.frame(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Other)
+
+# subsetting for CV CpGs
+subset_epic_annotation <- epic_annotation[epic_annotation$Methyl450_Loci %in% common_rownames, ]
+
+# function to remove repeated gene name to one CpG
+remove_repeated_entries <- function(x) {
+  elements <- str_split(x, ";")[[1]]
+  unique_elements <- unique(elements)
+  return(paste(unique_elements, collapse = ";"))
+}
+
+# function to remove more than one gene target to a gene
+keep_one <- function(values) {
+  if (is.na(values) || values == "") {
+    return(NA)
+  }
+  elements <- unlist(strsplit(values, ";"))
+  if (length(elements) == 1) {
+    return(elements)
+  }
+  set.seed(50)
+  random_element <- sample(elements, 1)
+  return(random_element)
+}
+# applying functions
+subset_epic_annotation_t <- subset_epic_annotation %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+subset_epic_annotation <- subset_epic_annotation_t %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, keep_one))
+
+# Merge with cpg_coff data
+merged_subset_epic_annotation <- merge(subset_epic_annotation, cpg_coff, by = "Methyl450_Loci")
+
+# remove entries with no connections, or NAs
+merged_subset_epic_annotation <- merged_subset_epic_annotation[!is.na(merged_subset_epic_annotation$UCSC_RefGene_Name) & 
+                                                                 merged_subset_epic_annotation$UCSC_RefGene_Name != "", ]
+
+# Map gene symbols to ENTREZ IDs
+merged_subset_epic_annotation$entrez_ids <- mapIds(org.Hs.eg.db, 
+                                                   keys = merged_subset_epic_annotation$UCSC_RefGene_Name, 
+                                                   column = "ENTREZID", 
+                                                   keytype = "SYMBOL", 
+                                                   multiVals = "first")
+# Filter out rows with missing ENTREZ IDs
+merged_subset_epic_annotation <- merged_subset_epic_annotation %>% filter(!is.na(entrez_ids))
+
+# Create named vector of coefficients for GO plot
+gene_coff <- setNames(merged_subset_epic_annotation$Coff, merged_subset_epic_annotation$entrez_ids)
+
+enrich_genes <- as.character(merged_subset_epic_annotation$entrez_ids)
+
+# getting names of genes which have more than 0.01 TPM expression in blood
+tpm_blood <- fread("./Data/gene_tpm_2022-06-06_v10_whole_blood.gct", skip = 2)
+tpm_blood$Name <- NULL
+tpm_blood <- as.data.frame(tpm_blood)
+Blood_genes <- tpm_blood$Description[apply(tpm_blood[, -1], 1, mean) > 0.01]
+Blood_genes <- mapIds(org.Hs.eg.db, keys = Blood_genes, column = "ENTREZID", keytype = "SYMBOL", multiVals = "first")
+Blood_genes <- Blood_genes[!is.na(Blood_genes)]
+
+# the subsetted gene list
+enrich_genes <- intersect(enrich_genes, as.character(Blood_genes))
+
+# Generate background ENTREZ IDs from all genes in annotation
+cpgs_test_all <- readRDS("./Data/top_corr_tfbs_cpgs.rds")
+epic_annotation_bg <- epic_annotation[epic_annotation$Methyl450_Loci %in% cpgs_test_all, ]
+epic_annotation_bg <- epic_annotation_bg %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+epic_annotation_bg <- epic_annotation_bg %>% mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, keep_one))
+epic_annotation_bg <- epic_annotation_bg[!is.na(epic_annotation_bg$UCSC_RefGene_Name) & epic_annotation_bg$UCSC_RefGene_Name != "", ]
+epic_annotation_bg$entrez_ids <- mapIds(org.Hs.eg.db, keys = epic_annotation_bg$UCSC_RefGene_Name, column = "ENTREZID", 
+                                        keytype = "SYMBOL", multiVals = "first")
+epic_annotation_bg <- epic_annotation_bg %>% filter(!is.na(entrez_ids))
+bg_genes <- as.character(epic_annotation_bg$entrez_ids)
+
+# the sub-setted gene list
+bg_genes <- intersect(bg_genes, as.character(Blood_genes))
+
+#enrichment analysis and plotting
+ego <- enrichGO(gene       = enrich_genes,
+                OrgDb         = org.Hs.eg.db,
+                keyType       = "ENTREZID",
+                ont           = "ALL",       
+                pAdjustMethod = "BH",
+                qvalueCutoff  = 0.05,
+                universe     = bg_genes,
+                readable      = TRUE)
+
+cnetplot(ego, showCategory=20, foldChange = gene_coff, cex_gene	= 5) + scale_color_gradient2(name = 'CpG_beta_cofficient', low = '#006666', mid = 'white', high = '#662700', midpoint = 0, limits = c(-1, 1))
+
+```
+
+## Target genes of age-predictive CpGs selected by TFMethyl Clock - Figure 5C
+
+Running clust algorithm to generate clusters of target-gene expression
+
+```{r Figure 5C, fig.width=12, fig.height=5}
+
+# Load cross-validated beta coefficients (10-fold CV results)
+coffs <- readRDS("./Data/10_fold_beta_coff_CV_results.rds")
+
+# Set row names of each coefficient data frame using the second column (e.g., CpG IDs)
+coffs <- lapply(coffs, function(df) {
+  rownames(df) <- df[[2]]
+  return(df)
+})
+
+# Identify CpGs that appear in at least 10 folds (i.e., consistently selected)
+Our <- names(which(table(unlist(lapply(coffs, rownames))) >= 10))
+
+# Combine coefficients across folds, keeping only the common CpGs
+coffs_common_df <- do.call(cbind, lapply(coffs, function(df) df[Our, , drop = FALSE]))
+
+# Retain only every third column (corresponding to beta coefficients)
+coffs_common_df <- coffs_common_df[, seq(3, ncol(coffs_common_df), by = 3), drop = FALSE]
+
+# Compute the median coefficient across folds for each CpG
+coffs_common_df$avg <- rowMedians(as.matrix(coffs_common_df), na.rm = TRUE)
+
+# Create a CpG–coefficient mapping data frame
+cpg_coff <- data.frame(Coff = coffs_common_df$avg, Methyl450_Loci = Our)
+
+# Annotating CpGs with gene names
+# Load EPIC v2 annotation data
+epic_annotation <- as.data.frame(IlluminaHumanMethylationEPICv2anno.20a1.hg38::Other)
+
+# Subset annotation to CpGs of interest
+subset_epic_annotation <- epic_annotation[epic_annotation$Methyl450_Loci %in% Our, ]
+
+# Helper function to remove duplicate gene names within a semicolon-separated string
+remove_repeated_entries <- function(x) {
+  elements <- str_split(x, ";")[[1]]
+  unique_elements <- unique(elements)
+  return(paste(unique_elements, collapse = ";"))
+}
+
+# Helper function to randomly select a single gene name if multiple are present
+keep_one <- function(values) {
+  if (is.na(values) || values == "") {
+    return(NA)
+  }
+  elements <- unlist(strsplit(values, ";"))
+  if (length(elements) == 1) {
+    return(elements)
+  }
+  set.seed(50)  # Ensure reproducibility of random selection
+  random_element <- sample(elements, 1)
+  return(random_element)
+}
+
+# Remove duplicated gene symbols per CpG
+subset_epic_annotation <- subset_epic_annotation %>%
+  mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, remove_repeated_entries))
+
+# Keep a single gene symbol per CpG
+subset_epic_annotation <- subset_epic_annotation %>%
+  mutate(UCSC_RefGene_Name = sapply(UCSC_RefGene_Name, keep_one))
+
+# Drop CpGs without valid gene annotations
+subset_epic_annotation <- subset_epic_annotation[
+  !is.na(subset_epic_annotation$UCSC_RefGene_Name) &
+    subset_epic_annotation$UCSC_RefGene_Name != "", ]
+
+# Merge CpG annotations with averaged beta coefficients
+subset_epic_annotation <- merge(subset_epic_annotation, cpg_coff, by = "Methyl450_Loci")
+
+# Finding gene expression values of target genes
+# Load whole blood TPM expression data (GTEx)
+tpm_blood <- fread("./Data/gene_tpm_2022-06-06_v10_whole_blood.gct", skip = 2)
+
+# Load GTEx sample metadata
+tpm_blood_metadata <- fread("./Data/GTEx_Analysis_v10_Annotations_SubjectPhenotypesDS.txt")
+
+# Remove the gene ID column, keep expression values
+tpm_blood$Name <- NULL
+tpm_blood <- as.data.frame(tpm_blood)
+
+# Filter expression matrix to genes mapped from CpGs
+filtered_tpm_blood <- tpm_blood[
+  tpm_blood$Description %in% unique(subset_epic_annotation$UCSC_RefGene_Name), ]
+
+# Average expression across probes mapping to the same gene
+filtered_tpm_blood <- filtered_tpm_blood %>%
+  group_by(Description) %>%
+  summarize(across(everything(), mean, na.rm = TRUE))
+
+# Convert back to a standard data frame
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood)
+
+# Set gene names as row names
+rownames(filtered_tpm_blood) <- filtered_tpm_blood$Description
+filtered_tpm_blood$Description <- NULL
+
+# Shorten sample IDs to match metadata
+colnames(filtered_tpm_blood) <- substr(colnames(filtered_tpm_blood), 1, 10)
+
+# Transpose to samples × genes
+filtered_tpm_blood <- as.data.frame(t(filtered_tpm_blood))
+
+# Bin ages into midpoints (e.g., 20–29 → ~25)
+tpm_blood_metadata$AGE <- as.numeric(substr(tpm_blood_metadata$AGE, 1, 2)) + 5
+
+# Order samples by age
+tpm_blood_metadata <- tpm_blood_metadata %>% arrange(AGE)
+
+# Keep only samples present in the expression matrix
+tpm_blood_metadata <- as.data.frame(tpm_blood_metadata %>% filter(SUBJID %in% rownames(filtered_tpm_blood)))
+
+# Reorder expression matrix to match metadata sample order
+filtered_tpm_blood <- as.data.frame(filtered_tpm_blood[tpm_blood_metadata$SUBJID, ])
+
+# Move sample IDs into a column
+filtered_tpm_blood <- filtered_tpm_blood %>% rownames_to_column(var = "SUBJID")
+
+# Merge expression data with age information
+gene_expression <- tpm_blood_metadata %>%
+  dplyr::select(SUBJID, AGE) %>%
+  inner_join(filtered_tpm_blood, by = "SUBJID")
+
+# Aggregate expression by age group using the median
+gene_expression <- gene_expression %>%
+  group_by(AGE) %>%
+  summarise(across(where(is.numeric), median, na.rm = TRUE), .groups = "drop")
+
+gene_expression <- as.data.frame(gene_expression)
+
+# -------------------------------
+# Filtering to blood-expressed genes
+# -------------------------------
+
+# Identify genes expressed in blood above a minimal mean threshold
+Blood_genes <- tpm_blood$Description[
+  apply(tpm_blood[, -1], 1, mean) > 0.01
+]
+
+# Map gene symbols to Entrez IDs
+Blood_genes <- mapIds(
+  org.Hs.eg.db,
+  keys = Blood_genes,
+  column = "ENTREZID",
+  keytype = "SYMBOL",
+  multiVals = "first"
+)
+
+# Remove unmapped genes
+Blood_genes <- Blood_genes[!is.na(Blood_genes)]
+
+# Keep only AGE and blood-expressed genes
+gene_expression <- gene_expression[
+  , names(gene_expression) %in% c(names(Blood_genes), "AGE")
+]
+
+# -------------------------------
+# Writing expression matrix for clust
+# -------------------------------
+
+# Transpose so genes are rows and age bins are columns
+to_write <- as.data.frame(t(gene_expression)[-1, ])
+
+# Add gene names as a column
+to_write$Genes <- rownames(to_write)
+
+# Reorder columns to put gene names first
+to_write <- to_write[, c(ncol(to_write), 1:(ncol(to_write) - 1))]
+
+# Write expression matrix to disk for clustering
+write.table(
+  to_write,
+  "./Data/clust/gene_expression_for_target_genes_clust.tsv",
+  sep = "\t",
+  quote = FALSE,
+  col.names = TRUE,
+  row.names = FALSE
+)
+
+# -------------------------------------------------------
+
+# Running clust (iterative clustering)
+
+#This snippet documents the steps used to run **clust** in a conda environment on a gene expression matrix. 
+# - First, the working directory is set and the Conda environment is prepared. 
+# - A dedicated Conda environment (clust-env) with Python 3.11 is activated to ensure dependency isolation and reproducibility. 
+# - Required Python and bioinformatics dependencies (NumPy, SciPy, scikit-learn, and clust from Bioconda) are installed once and reused. 
+# - Finally, clust is executed on a TSV-formatted gene expression file, and the results are written to a specified output directory. 
+
+# # This setup ensures a clean, reproducible environment for running the clustering analysis in bash. NOTE: Can be computationally and time expensive. 
+
+# source ./conda/bin/activate 
+# conda create -n clust-env python=3.11 
+# conda activate clust-env 
+# conda install numpy=1.26 scipy scikit-learn 
+# conda install -c bioconda clust 
+
+# first round
+# clust ./Data/clust/gene_expression_for_target_genes_clust.tsv -o ./Data/clust/run1/
+
+# Read clustering results from first clust run
+clust_objects1 <- read_tsv("./Data/clust/run1/Clusters_Objects.tsv")
+
+# Rename cluster columns to C1, C2, ...
+colnames(clust_objects1) <- paste0("C", 1:ncol(clust_objects1))
+n_clusters <- ncol(clust_objects1)
+
+# Convert cluster membership table to long format
+clust_objects1 <- clust_objects1 %>%
+  pivot_longer(contains("C"), names_to = "cluster", values_to = "gene") %>%
+  dplyr::filter(gene != "Genes")
+
+# Load original expression matrix
+rna.clust <- read.table("./Data/clust/gene_expression_for_target_genes_clust.tsv")
+
+# Remove genes already assigned to clusters in run 1
+rna.clust2 <- rna.clust %>%
+  dplyr::filter(!V1 %in% c(clust_objects1$gene))
+
+# write.table(rna.clust2, "./Data/clust/gene_expression_for_target_genes_clust_temp.tsv", # sep="\t", col.names = FALSE, quote=FALSE, row.names = FALSE) 
+
+#----------
+# second round
+# clust ./Data/clust/gene_expression_for_target_genes_clust_temp.tsv -o ./Data/clust/run2/
+
+# Read clustering results from second clust run
+clust_objects2 <- read_tsv("./Data/clust/run2/Clusters_Objects.tsv")
+colnames(clust_objects2) <- paste0("C", 1:ncol(clust_objects2))
+n_clusters <- ncol(clust_objects2)
+
+# Convert second-run clusters to long format
+clust_objects2 <- clust_objects2 %>%
+  pivot_longer(contains("C"), names_to = "cluster", values_to = "gene") %>%
+  dplyr::filter(gene != "Genes")
+
+# Load expression matrix used in run 2
+rna.clust2 <- read.table("./Data/clust/gene_expression_for_target_genes_clust_temp.tsv")
+
+# Remove genes clustered in run 2
+rna.clust3 <- rna.clust2 %>%
+  dplyr::filter(!V1 %in% c(clust_objects2$gene))
+
+# write.table(rna.clust3, "./Data/clust/gene_expression_for_target_genes_clust_temp_temp.tsv", # sep="\t", col.names = FALSE, quote=FALSE, row.names = FALSE) 
+
+#----------
+# third round
+# clust ./Data/clust/gene_expression_for_target_genes_clust_temp_temp.tsv -o ./Data/clust/run3/
+
+#----------
+# Preparing data frame for plotting
+# Load processed expression data from run 1
+rna.clust <- read.table("./Data/clust/run1/Processed_Data/gene_expression_for_target_genes_clust.tsv_processed.tsv", 
+                        header = TRUE)
+
+# Merge expression values with cluster labels (run 1)
+rna.clust_m1 <- merge(rna.clust, clust_objects1, by.x = "Genes", by.y = "gene")
+
+# Load processed expression data from run 2
+rna.clust_2 <- read.table("./Data/clust/run2/Processed_Data/gene_expression_for_target_genes_clust_temp.tsv_processed.tsv",
+                          header = TRUE)
+
+# Merge expression values with cluster labels (run 2)
+rna.clust_m2 <- merge(rna.clust_2, clust_objects2, by.x = "Genes", by.y = "gene")
+
+# Re-label clusters from run 2 to avoid overlap with run 1
+rna.clust_m2 <- rna.clust_m2 %>%
+  mutate(cluster = case_when(
+    cluster == "C1" ~ "C3",
+    cluster == "C2" ~ "C4",
+    cluster == "C3" ~ "C5",
+    TRUE ~ cluster))
+
+# Combine clustered genes from both runs
+rna.clust_m <- rbind(rna.clust_m1, rna.clust_m2)
+
+# Convert expression matrix to long format for ggplot
+df_long <- rna.clust_m %>%
+  dplyr::mutate(row_id = row_number()) %>%
+  pivot_longer(
+    cols = starts_with("V"),
+    names_to = "x",
+    values_to = "y") %>%
+  mutate(x = as.numeric(gsub("V", "", x)))
+
+# Plot gene expression trajectories across age bins by cluster
+ggplot(df_long, aes(x = x, y = y, group = row_id, color = cluster)) +
+  geom_line() +
+  facet_wrap(~ cluster, ncol = 6) +
+  scale_color_manual(values = c(
+    "C1" = "#009292",
+    "C2" = "#924900",
+    "C3" = "#FFB6DB",
+    "C4" = "#466983",
+    "C5" = "#ff7f0e")) +
+  theme_minimal() +
+  labs(title = "Expression trajectories",
+    x = "Aging",
+    y = "z-scores") +
+  theme(panel.grid = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.8),
+    axis.title = element_text(size = 16),
+    axis.text = element_text(size = 14),
+    axis.ticks.x = element_line(color = "black", size = 0.6),
+    axis.ticks.length = unit(5, "pt"),
+    axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_x_continuous(breaks = c(1, 2, 3, 4, 5, 6),
+    labels = c("20-29", "30-39", "40-49", "50-59", "60-69", "70-79")  )
+
+```
+
+## Generating genomic region bed file for footprinting analysis (via TOBIAS tool in bash)
+
+In TFBS losing and gaining methylation strongly with age. 
+
+```{r Footprinting regions}
+
+## Load sorted TFBS annotation
+# tfbs_sites <- fread("./Data/sorted_intersection.bed")
+# tfbs_sites$V4 <- NULL
+# tfbs_sites$V5 <- NULL
+# tfbs_sites <- unique(tfbs_sites)
+# 
+# # loading CpGs age correlations
+# corr <- readRDS("./Data/corr.rds")
+# 
+# # loading CpGs genomic locations
+# data("Locations", package = "IlluminaHumanMethylationEPICv2anno.20a1.hg38")
+# cpg_location <- as.data.frame(Locations)
+# 
+# # Create Start and End positions for CpGs
+# cpg_location <- cpg_location %>% mutate(Start = pos - 1, End = pos + 1, Name = sub("_.*$", "", rownames(cpg_location)))
+# 
+# # Filter for CpGs for which we could find experimental evidence
+# cpg_location <- cpg_location[cpg_location$Name %in% corr$CpG, ]
+# 
+# # Create GRanges object for CpGs
+# epic_gr <- GRanges(seqnames = cpg_location$chr,
+#   ranges = IRanges(start = cpg_location$Start, end = cpg_location$End),
+#   Name = cpg_location$Name)
+# epic_gr <- sort(epic_gr)
+# 
+# # Create GRanges object for TFBS sites
+# reg_gr <- GRanges(seqnames = tfbs_sites$V1,
+#   ranges = IRanges(start = tfbs_sites$V2, end = tfbs_sites$V3), Name = tfbs_sites$V7)
+# reg_gr <- sort(reg_gr)
+# 
+# # Identify overlaps
+# overlaps <- findOverlaps(epic_gr, reg_gr, ignore.strand = TRUE)
+# 
+# # Extract overlapping CpGs
+# overlapping_reg_gr <- reg_gr[subjectHits(overlaps)]
+# 
+# # Convert to data frame 
+# overlapping_reg_gr_df <- as.data.frame(overlapping_reg_gr)
+# 
+# # Extract overlapping CpGs
+# overlapping_epic_gr <- epic_gr[queryHits(overlaps)]
+# 
+# # Convert to data frame 
+# overlapping_epic_gr_df <- as.data.frame(overlapping_epic_gr)
+# overlapping_reg_gr_df$CpGs <- overlapping_epic_gr_df$Name
+# 
+# # Merging CpG locations with their age correlations
+# overlapping_reg_gr_df_merged <- merge(overlapping_reg_gr_df, corr, by.x = "CpGs", by.y = "CpG")
+# 
+# # strong age correlations filter
+# overlapping_reg_gr_df_merged_fil <- overlapping_reg_gr_df_merged[abs(overlapping_reg_gr_df_merged$Correlation) > 0.5,]
+# overlapping_reg_gr_df_merged_fil_more_up <- overlapping_reg_gr_df_merged_fil[overlapping_reg_gr_df_merged_fil$Correlation > 0,]
+# overlapping_reg_gr_df_merged_fil_more_down <- overlapping_reg_gr_df_merged_fil[overlapping_reg_gr_df_merged_fil$Correlation < 0,]
+# 
+# # writing bed files as input to TOBIAS
+# write.table(overlapping_reg_gr_df_merged_fil_more_up[, c(2:4)], "./Data/gaining_met.bed", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+# write.table(overlapping_reg_gr_df_merged_fil_more_down[, c(2:4)], "./Data/losing_met.bed", sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+
+```
+
+## Analysis run session documentation 
+
+```{r}
+
+sessionInfo()
+
+```
