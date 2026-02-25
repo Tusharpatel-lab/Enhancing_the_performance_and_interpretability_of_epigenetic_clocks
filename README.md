@@ -40,7 +40,8 @@ Then first run `./helper_scripts/packages_check.R`, finally followed by the `Ana
 
 ## Notes
 
-* The processed data (as`./Data`) required to run `Analysis.Rmd` - is the ONLY missing directory (~16GBs) in this repository (download from Zenodo). 
-* All TFMethyl clock required data objects are included as (`./Run_TFMethyl/*.rds`). 
+* The processed data (as`./Data`) required to run `Analysis.Rmd` - is the missing directory (~7GBs) in this repository (download from Zenodo). 
+* The processed methylation dataset `beta_matrix.csv` utilized by `Analysis.Rmd` is available only on requests. 
+* All TFMethyl clock required data objects are included as (`./Run_TFMethyl/*.rds`).
 
 ---
