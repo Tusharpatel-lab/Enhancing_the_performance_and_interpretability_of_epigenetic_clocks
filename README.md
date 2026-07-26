@@ -3,7 +3,7 @@
 # TFMethyl DNAm aging-clock
 
 **Source code for the work "Enhancing the performance and interpretability of epigenetic clocks"**
-🔗 [Preprint](https://www.biorxiv.org/content/10.1101/2025.10.07.680024v2)
+🔗 [NAR](https://doi.org/10.1093/nar/gkag661)
 
 ---
 
